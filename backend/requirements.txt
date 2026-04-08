@@ -1,0 +1,42 @@
+# Web framework
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.7.1
+pydantic-settings==2.3.0
+python-multipart==0.0.9
+
+# Database
+sqlalchemy[asyncio]==2.0.30
+asyncpg==0.29.0
+alembic==1.13.1
+duckdb==0.10.3
+
+# Cache
+redis==5.0.4
+hiredis==2.3.2
+
+# ML core
+torch==2.3.0
+torch-geometric==2.5.3
+scikit-learn==1.5.0
+numpy==1.26.4
+pandas==2.2.2
+
+# Graph / GNN datasets
+networkx==3.3
+
+# Data processing
+pyarrow==16.1.0
+fastparquet==2024.5.0
+
+# Monitoring
+prometheus-client==0.20.0
+
+# Utilities
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+httpx==0.27.0
+structlog==24.2.0
+rich==13.7.1
+typer==0.12.3
+tqdm==4.66.4
