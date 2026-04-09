@@ -157,7 +157,8 @@ def score_transaction(
     }
 
     with torch.no_grad():
-        logits = model.forward(x_dict, edge_index_dict).item()
+        logits_tensor = model.forward(x_dict, edge_index_dict)
+        logits = float(logits_tensor.reshape(-1)[0].item())
         calibration = cache.get("calibration")
         if calibration:
                 prob = expit(calibration["scale"] * logits + calibration["bias"])
@@ -229,14 +230,19 @@ def _explain(features: np.ndarray, prob: float) -> Dict:
         "velocity_1h", "velocity_24h", "cross_border",
     ]
     features = np.array(features).flatten()
+    denom = float(np.abs(features[:7]).sum())
+    denom = max(denom, 1.0)
 
     top_features = []
     for i, name in enumerate(feature_names):
         if i < len(features):
+            contribution = float(abs(features[i]) * prob / denom)
+            if not np.isfinite(contribution):
+                contribution = 0.0
             top_features.append({
                 "name": name,
                 "value": round(float(features[i]), 4),
-                "contribution": round(float(abs(features[i]) * prob / max(sum(abs(features[:7])), 1e-8)), 4),
+                "contribution": round(contribution, 4),
             })
 
     top_features.sort(key=lambda x: x["contribution"], reverse=True)

@@ -1,9 +1,11 @@
 import json
 import redis.asyncio as aioredis
 from typing import Any, Optional
+import logging
 from app.core.config import get_settings
 
 settings = get_settings()
+log = logging.getLogger(__name__)
 
 _redis: Optional[aioredis.Redis] = None
 
@@ -16,22 +18,35 @@ async def get_redis() -> aioredis.Redis:
 
 
 async def cache_set(key: str, value: Any, ttl: int = None) -> None:
-    r = await get_redis()
-    await r.set(key, json.dumps(value), ex=ttl or settings.cache_ttl)
+    try:
+        r = await get_redis()
+        await r.set(key, json.dumps(value), ex=ttl or settings.cache_ttl)
+    except Exception as e:
+        log.warning(f"cache_set failed for key={key}: {e}")
 
 
 async def cache_get(key: str) -> Optional[Any]:
-    r = await get_redis()
-    val = await r.get(key)
-    return json.loads(val) if val else None
+    try:
+        r = await get_redis()
+        val = await r.get(key)
+        return json.loads(val) if val else None
+    except Exception as e:
+        log.warning(f"cache_get failed for key={key}: {e}")
+        return None
 
 
 async def cache_delete(key: str) -> None:
-    r = await get_redis()
-    await r.delete(key)
+    try:
+        r = await get_redis()
+        await r.delete(key)
+    except Exception as e:
+        log.warning(f"cache_delete failed for key={key}: {e}")
 
 
 async def publish_score(channel: str, data: dict) -> None:
     """Publish fraud score to WebSocket subscribers."""
-    r = await get_redis()
-    await r.publish(channel, json.dumps(data))
+    try:
+        r = await get_redis()
+        await r.publish(channel, json.dumps(data))
+    except Exception as e:
+        log.warning(f"publish_score failed for channel={channel}: {e}")

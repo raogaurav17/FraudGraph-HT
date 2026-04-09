@@ -4,15 +4,18 @@ Run: pytest tests/ -v
 """
 
 import numpy as np
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, AsyncMock
 from app.ml.inference import score_transaction, _get_risk_level, _pad_features
+from app.core.config import get_settings
 
 
 def test_risk_level_mapping():
-    assert _get_risk_level(0.90) == "CRITICAL"
-    assert _get_risk_level(0.65) == "HIGH"
-    assert _get_risk_level(0.35) == "MEDIUM"
-    assert _get_risk_level(0.10) == "LOW"
+    settings = get_settings()
+
+    assert _get_risk_level(settings.fraud_threshold_high + 0.05) == "CRITICAL"
+    assert _get_risk_level((settings.fraud_threshold_medium + settings.fraud_threshold_high) / 2) == "HIGH"
+    assert _get_risk_level((settings.fraud_threshold_low + settings.fraud_threshold_medium) / 2) == "MEDIUM"
+    assert _get_risk_level(max(settings.fraud_threshold_low - 0.05, 0.0)) == "LOW"
 
 
 def test_pad_features_short():
@@ -55,7 +58,8 @@ def test_health_endpoint():
     from fastapi.testclient import TestClient
     from app.main import app
 
-    with TestClient(app) as client:
-        response = client.get("/health")
-        assert response.status_code == 200
-        assert response.json()["status"] == "ok"
+    with patch("app.main.init_db", new=AsyncMock(return_value=None)), patch("app.main.load_model", return_value={}):
+        with TestClient(app) as client:
+            response = client.get("/health")
+            assert response.status_code == 200
+            assert response.json()["status"] == "ok"

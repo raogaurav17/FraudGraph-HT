@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
 
@@ -13,6 +13,8 @@ DEFAULT_MODEL_PATH = str(PROJECT_ROOT / "models" / "htgnn_latest.pt")
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env")
+
     # App
     app_name: str = "FraudGraph API"
     env: str = "development"
@@ -46,10 +48,6 @@ class Settings(BaseSettings):
 
     # WebSocket
     ws_ping_interval: int = 30
-
-    class Config:
-        env_file = ".env"
-
 
 @lru_cache()
 def get_settings() -> Settings:

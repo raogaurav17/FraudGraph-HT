@@ -4,22 +4,20 @@ Routes: /predict, /transactions, /model, /stats, /ws
 """
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, case
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import uuid
-import asyncio
 import json
 import numpy as np
 import logging
 
 from app.core.database import get_db
 from app.core.redis import cache_get, cache_set, get_redis
-from app.models.db import Transaction, FraudPrediction, ModelVersion, ModelMetricSnapshot, RiskLevel, DatasetSource
-from app.ml.inference import score_transaction, get_model_info, batch_score
+from app.models.db import Transaction, FraudPrediction, RiskLevel, DatasetSource
+from app.ml.inference import score_transaction, get_model_info
 from app.core.config import get_settings
 
 log = logging.getLogger(__name__)
@@ -75,6 +73,27 @@ class TransactionListOut(BaseModel):
     page_size: int
 
 
+def _build_txn_features(txn_in: TransactionIn) -> np.ndarray:
+    """Build a consistent feature vector for both single and batch inference."""
+    import math
+
+    log_amount = math.log1p(txn_in.amount)
+    hour = txn_in.hour_of_day or 12
+    hour_sin = math.sin(2 * math.pi * hour / 24)
+    hour_cos = math.cos(2 * math.pi * hour / 24)
+
+    return np.array([
+        log_amount,
+        hour_sin,
+        hour_cos,
+        float(txn_in.country_mismatch or 0),
+        txn_in.velocity_1h or 0,
+        txn_in.velocity_24h or 0,
+        txn_in.merchant_fraud_rate or 0,
+        (txn_in.card_avg_amount_30d or txn_in.amount) / (txn_in.amount + 1),
+    ], dtype=np.float32)
+
+
 # ─────────────────────────────────────────────────────────────────
 # PREDICT
 # ─────────────────────────────────────────────────────────────────
@@ -85,8 +104,6 @@ async def predict(
     db: AsyncSession = Depends(get_db),
 ):
     """Score a single transaction for fraud probability."""
-    import math, time
-
     # Check cache
     cache_key = f"score:{txn_in.transaction_id}"
     cached = await cache_get(cache_key)
@@ -94,19 +111,7 @@ async def predict(
         return cached
 
     # Build feature vector
-    log_amount = math.log1p(txn_in.amount)
-    hour = txn_in.hour_of_day or 12
-    hour_sin = math.sin(2 * math.pi * hour / 24)
-    hour_cos = math.cos(2 * math.pi * hour / 24)
-
-    txn_features = np.array([
-        log_amount, hour_sin, hour_cos,
-        float(txn_in.country_mismatch or 0),
-        txn_in.velocity_1h or 0,
-        txn_in.velocity_24h or 0,
-        txn_in.merchant_fraud_rate or 0,
-        (txn_in.card_avg_amount_30d or txn_in.amount) / (txn_in.amount + 1),
-    ], dtype=np.float32)
+    txn_features = _build_txn_features(txn_in)
 
     # Score
     result = score_transaction(txn_features=txn_features)
@@ -122,6 +127,7 @@ async def predict(
     )
 
     # Persist prediction
+    db_write_ok = False
     try:
         txn_db = Transaction(
             transaction_id=txn_in.transaction_id,
@@ -144,18 +150,30 @@ async def predict(
         )
         db.add(pred_db)
         await db.commit()
+        db_write_ok = True
     except Exception as e:
-        log.warning(f"Failed to persist prediction: {e}")
+        await db.rollback()
+        log.error(f"Failed to persist prediction: {e}")
 
-    # Cache + publish to WebSocket
     resp_dict = response.model_dump()
-    await cache_set(cache_key, resp_dict, ttl=60)
 
-    r = await get_redis()
-    await r.publish("fraud_scores", json.dumps({
-        "type": "new_prediction",
-        "data": resp_dict,
-    }))
+    # Only emit/cache from fresh computations when persistence succeeded.
+    if db_write_ok:
+        try:
+            await cache_set(cache_key, resp_dict, ttl=60)
+        except Exception as e:
+            log.warning(f"Failed to cache prediction response: {e}")
+
+        try:
+            r = await get_redis()
+            await r.publish("fraud_scores", json.dumps({
+                "type": "new_prediction",
+                "data": resp_dict,
+            }))
+        except Exception as e:
+            log.warning(f"Failed to publish prediction to Redis channel: {e}")
+    else:
+        raise HTTPException(status_code=500, detail="Prediction could not be persisted")
 
     return response
 
@@ -166,11 +184,9 @@ async def predict_batch(payload: BatchPredictIn):
     if len(payload.transactions) > 100:
         raise HTTPException(status_code=422, detail="Max 100 transactions per batch")
 
-    import math
     results = []
     for txn in payload.transactions:
-        log_amount = math.log1p(txn.amount)
-        features = np.array([log_amount, txn.velocity_1h or 0, txn.velocity_24h or 0])
+        features = _build_txn_features(txn)
         r = score_transaction(txn_features=features)
         r["transaction_id"] = txn.transaction_id
         results.append(r)
@@ -289,7 +305,7 @@ async def stats_overview(db: AsyncSession = Depends(get_db)):
     # Fraud flagged
     fraud_result = await db.execute(
         select(func.count(FraudPrediction.id))
-        .where(FraudPrediction.risk_level.in_(["HIGH", "CRITICAL"]))
+        .where(FraudPrediction.risk_level.in_([RiskLevel.HIGH, RiskLevel.CRITICAL]))
     )
     fraud_flagged = fraud_result.scalar() or 0
 
@@ -302,7 +318,11 @@ async def stats_overview(db: AsyncSession = Depends(get_db)):
         select(FraudPrediction.risk_level, func.count(FraudPrediction.id))
         .group_by(FraudPrediction.risk_level)
     )
-    risk_dist = {row[0]: row[1] for row in risk_result.all() if row[0]}
+    risk_dist = {
+        (row[0].value if hasattr(row[0], "value") else str(row[0])): row[1]
+        for row in risk_result.all()
+        if row[0]
+    }
 
     # Dataset breakdown
     ds_result = await db.execute(
@@ -333,14 +353,22 @@ async def stats_timeseries(
     if cached:
         return cached
 
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
     # Aggregate by hour using raw SQL via DuckDB-style grouping
     result = await db.execute(
         select(
             func.date_trunc("hour", Transaction.created_at).label("hour"),
             func.count(Transaction.id).label("total"),
-            func.sum(func.cast(FraudPrediction.risk_level.in_(["HIGH", "CRITICAL"]), db.bind.dialect.name == "postgresql" and "integer" or "integer")).label("fraud"),
+            func.sum(
+                case(
+                    (FraudPrediction.risk_level.in_([RiskLevel.HIGH, RiskLevel.CRITICAL]), 1),
+                    else_=0,
+                )
+            ).label("fraud"),
         )
         .outerjoin(FraudPrediction, Transaction.transaction_id == FraudPrediction.transaction_id)
+        .where(Transaction.created_at >= cutoff)
         .group_by(func.date_trunc("hour", Transaction.created_at))
         .order_by(func.date_trunc("hour", Transaction.created_at))
     )
@@ -365,9 +393,10 @@ class ConnectionManager:
         self.connections.append(ws)
 
     def disconnect(self, ws: WebSocket):
-        self.connections.discard(ws) if hasattr(self.connections, 'discard') else None
-        if ws in self.connections:
+        try:
             self.connections.remove(ws)
+        except ValueError:
+            pass
 
     async def broadcast(self, message: str):
         dead = []
@@ -387,15 +416,21 @@ manager = ConnectionManager()
 async def websocket_scores(websocket: WebSocket):
     """Real-time WebSocket stream of fraud scores."""
     await manager.connect(websocket)
-    r = await get_redis()
-    pubsub = r.pubsub()
-    await pubsub.subscribe("fraud_scores")
+    pubsub = None
 
     try:
+        r = await get_redis()
+        pubsub = r.pubsub()
+        await pubsub.subscribe("fraud_scores")
+
         async for message in pubsub.listen():
             if message["type"] == "message":
                 await websocket.send_text(message["data"])
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        pass
+    except Exception as e:
+        log.warning(f"WebSocket Redis stream error: {e}")
     finally:
-        await pubsub.unsubscribe("fraud_scores")
+        manager.disconnect(websocket)
+        if pubsub is not None:
+            await pubsub.unsubscribe("fraud_scores")
