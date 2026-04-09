@@ -388,21 +388,22 @@ def train(
     hidden: int = 128,
     heads: int = 4,
     dropout: float = 0.3,
-    lr: float = 3e-4,
+    lr: float = 1e-3,
     weight_decay: float = 1e-4,
-    batch_size: int = 256,
+    batch_size: int = 512,
     patience: int = 8,
-    loss_name: str = "weighted_focal_smooth",
+    loss_name: str = "weighted_bce",
     focal_alpha: float = 0.5,
     focal_gamma: float = 2.0,
     smoothing: float = 0.05,
     pos_weight: Optional[float] = None,
     max_rows: Optional[int] = None,
-    max_v_features: int = 120,
+    max_v_features: int = 160,
     max_cards_per_device: int = 20,
-    neighbor_hop1: int = 4,
-    neighbor_hop2: int = 2,
-    feature_mode: str = "original",
+    neighbor_hop1: int = 16,
+    neighbor_hop2: int = 8,
+    feature_mode: str = "enhanced",
+    pos_oversample_factor: int = 1,
     save_path: Optional[str] = None,
     artifacts_dir: Optional[str] = None,
     logs_dir: Optional[str] = None,
@@ -493,7 +494,7 @@ def train(
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"Model parameters: {n_params:,}")
 
-    # ── Oversample positives ──
+    # ── Train seed nodes (optional positive oversampling) ──
     train_mask = data[node_type].train_mask
     train_idx = train_mask.nonzero(as_tuple=False).view(-1)
     train_labels_idx = data[node_type].y[train_idx]
@@ -501,12 +502,15 @@ def train(
     pos_idx = train_idx[train_labels_idx == 1]
     neg_idx = train_idx[train_labels_idx == 0]
     
-    # Duplicate positive samples to balance the batch a bit more, say 4x
-    if len(pos_idx) > 0 and len(pos_idx) < len(neg_idx):
-        dup_factor = min(4, len(neg_idx) // len(pos_idx))
+    if (
+        pos_oversample_factor > 1
+        and len(pos_idx) > 0
+        and len(pos_idx) < len(neg_idx)
+    ):
+        dup_factor = min(int(pos_oversample_factor), max(1, len(neg_idx) // len(pos_idx)))
         balanced_train_idx = torch.cat([neg_idx] + [pos_idx] * dup_factor)
-        # shuffle
         balanced_train_idx = balanced_train_idx[torch.randperm(len(balanced_train_idx))]
+        log.info("Positive oversampling enabled with factor=%d", dup_factor)
     else:
         balanced_train_idx = train_idx
     
@@ -551,11 +555,10 @@ def train(
     log.info(f"Using loss function: {loss_name}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        mode="max",
-        factor=0.5,
-        patience=2,
+        T_max=max(epochs, 1),
+        eta_min=1e-5,
     )
     early_stop = EarlyStopping(patience=patience)
 
@@ -599,7 +602,7 @@ def train(
         })
 
         if scheduler is not None:
-            scheduler.step(val_metrics["auprc"])
+            scheduler.step()
 
         if val_metrics["auprc"] > best_val_auprc:
             best_val_auprc = val_metrics["auprc"]
@@ -744,19 +747,20 @@ if __name__ == "__main__":
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--loss", choices=list(AVAILABLE_LOSSES), default="weighted_focal_smooth")
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--loss", choices=list(AVAILABLE_LOSSES), default="weighted_bce")
     parser.add_argument("--focal-alpha", type=float, default=0.5)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
     parser.add_argument("--smoothing", type=float, default=0.05)
     parser.add_argument("--pos-weight", type=float, default=None)
     parser.add_argument("--max-rows", type=int, default=None)
-    parser.add_argument("--max-v-features", type=int, default=120)
+    parser.add_argument("--max-v-features", type=int, default=160)
     parser.add_argument("--max-cards-per-device", type=int, default=20)
-    parser.add_argument("--neighbor-hop1", type=int, default=4)
-    parser.add_argument("--neighbor-hop2", type=int, default=2)
-    parser.add_argument("--feature-mode", choices=["original", "enhanced"], default="original")
+    parser.add_argument("--neighbor-hop1", type=int, default=16)
+    parser.add_argument("--neighbor-hop2", type=int, default=8)
+    parser.add_argument("--feature-mode", choices=["original", "enhanced"], default="enhanced")
+    parser.add_argument("--pos-oversample-factor", type=int, default=1)
     parser.add_argument("--save-path", default=None)
     parser.add_argument("--artifacts-dir", default='artifacts')
     parser.add_argument("--logs-dir", default=None)
@@ -781,6 +785,7 @@ if __name__ == "__main__":
         neighbor_hop1=args.neighbor_hop1,
         neighbor_hop2=args.neighbor_hop2,
         feature_mode=args.feature_mode,
+        pos_oversample_factor=args.pos_oversample_factor,
         save_path=args.save_path,
         artifacts_dir=args.artifacts_dir,
         logs_dir=args.logs_dir,
