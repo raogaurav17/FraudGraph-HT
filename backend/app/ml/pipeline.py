@@ -48,11 +48,21 @@ class IEEECISPipeline:
         "ProductCD", "P_emaildomain", "R_emaildomain",
         "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9",
     ]
-    V_COLS = [f"V{i}" for i in range(1, 100)]  # first 99 V-features
+    V_COLS = [f"V{i}" for i in range(1, 340)]
+    FREE_EMAIL_DOMAINS = {"gmail.com", "yahoo.com", "hotmail.com"}
 
-    def __init__(self, data_dir: str, max_rows: Optional[int] = None):
+    def __init__(
+        self,
+        data_dir: str,
+        max_rows: Optional[int] = None,
+        max_v_features: int = 160,
+        max_cards_per_device: int = 20,
+    ):
         self.data_dir = Path(data_dir)
         self.max_rows = max_rows
+        self.seq_len = 15
+        self.max_v_features = max(0, min(max_v_features, len(self.V_COLS)))
+        self.max_cards_per_device = max(2, max_cards_per_device)
 
     def load_raw(self) -> pd.DataFrame:
         tx_path = self.data_dir / "train_transaction.csv"
@@ -61,6 +71,7 @@ class IEEECISPipeline:
         if not tx_path.exists():
             raise FileNotFoundError(f"IEEE-CIS data not found at {tx_path}. See data/README.md")
 
+        selected_v_cols = self.V_COLS[: self.max_v_features] if self.max_v_features else []
         tx_usecols = [
             "TransactionID",
             "TransactionDT",
@@ -71,7 +82,7 @@ class IEEECISPipeline:
             *[col for col in self.TXN_NUM_COLS if col != "TransactionAmt"],
             *self.CARD_COLS,
             *self.TXN_CAT_COLS,
-            *self.V_COLS,
+            *selected_v_cols,
         ]
 
         log.info(
@@ -87,7 +98,13 @@ class IEEECISPipeline:
     def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()
 
-        # Card proxy identity
+        # Split is needed for leakage-safe imputations/statistics.
+        t = pd.to_numeric(df["TransactionDT"], errors="coerce").fillna(0).to_numpy(dtype=np.float64)
+        q70 = np.quantile(t, 0.7)
+        q85 = np.quantile(t, 0.85)
+        df["split"] = np.where(t < q70, "train", np.where(t < q85, "val", "test"))
+
+        # Card proxy identity and canonical IDs.
         df["card_id"] = df[self.CARD_COLS].fillna("NA").astype(str).agg("-".join, axis=1)
         df["email_id"] = (
             df["P_emaildomain"].fillna("NA").astype(str)
@@ -97,94 +114,11 @@ class IEEECISPipeline:
         df["device_id"] = df["DeviceInfo"].fillna("unknown").astype(str)
         df["addr_id"] = df["addr1"].fillna("NA").astype(str)
 
-        # Keep chronological order for rolling feature construction.
-        df = df.sort_values(["card_id", "TransactionDT", "TransactionID"]).reset_index(drop=False)
-        df = df.rename(columns={"index": "_orig_index"})
-
-        n_rows = len(df)
-        time_since_last = np.zeros(n_rows, dtype=np.float32)
-        txn_count_1d = np.zeros(n_rows, dtype=np.float32)
-        txn_count_7d = np.zeros(n_rows, dtype=np.float32)
-        txn_count_30d = np.zeros(n_rows, dtype=np.float32)
-        avg_amt_user = np.zeros(n_rows, dtype=np.float32)
-        std_amt_user = np.zeros(n_rows, dtype=np.float32)
-        unique_devices_per_user = np.zeros(n_rows, dtype=np.float32)
-        unique_emails_per_card = np.zeros(n_rows, dtype=np.float32)
-        card_device_count = np.zeros(n_rows, dtype=np.float32)
-        card_addr_count = np.zeros(n_rows, dtype=np.float32)
-        email_device_count = np.zeros(n_rows, dtype=np.float32)
-
-        one_day = 86400.0
-        seven_days = 7.0 * one_day
-        thirty_days = 30.0 * one_day
-
-        for _, group in df.groupby("card_id", sort=False):
-            idx = group.index.to_numpy()
-            times = group["TransactionDT"].to_numpy(dtype=np.float64, copy=False)
-            amounts = group["TransactionAmt"].to_numpy(dtype=np.float32, copy=False)
-            devices = group["device_id"].astype(str).to_numpy()
-            emails = group["email_id"].astype(str).to_numpy()
-            addrs = group["addr_id"].astype(str).to_numpy()
-
-            n_group = len(group)
-            if n_group == 0:
-                continue
-
-            if n_group > 1:
-                time_since_last[idx[1:]] = np.diff(times).astype(np.float32, copy=False)
-
-            count_before = np.arange(n_group, dtype=np.float32)
-            prev_sum = np.cumsum(amounts, dtype=np.float64) - amounts
-            prev_sq = np.cumsum(amounts ** 2, dtype=np.float64) - amounts ** 2
-            avg_prev = np.zeros(n_group, dtype=np.float64)
-            np.divide(prev_sum, count_before, out=avg_prev, where=count_before > 0)
-            var_prev = np.zeros(n_group, dtype=np.float64)
-            np.divide(
-                prev_sq,
-                count_before,
-                out=var_prev,
-                where=count_before > 1,
-            )
-            var_prev = var_prev - np.square(avg_prev)
-            var_prev[count_before <= 1] = 0.0
-
-            starts_1d = np.searchsorted(times, times - one_day, side="left")
-            starts_7d = np.searchsorted(times, times - seven_days, side="left")
-            starts_30d = np.searchsorted(times, times - thirty_days, side="left")
-            positions = np.arange(n_group, dtype=np.float32)
-
-            txn_count_1d[idx] = positions - starts_1d.astype(np.float32)
-            txn_count_7d[idx] = positions - starts_7d.astype(np.float32)
-            txn_count_30d[idx] = positions - starts_30d.astype(np.float32)
-            avg_amt_user[idx] = avg_prev.astype(np.float32, copy=False)
-            std_amt_user[idx] = np.sqrt(np.clip(var_prev, 0.0, None)).astype(np.float32, copy=False)
-
-            seen_devices = set()
-            seen_emails = set()
-            seen_addrs = set()
-            device_counts = defaultdict(int)
-            addr_counts = defaultdict(int)
-            email_device_counts = defaultdict(int)
-
-            for pos, (device, email, addr) in enumerate(zip(devices, emails, addrs)):
-                seen_devices.add(device)
-                seen_emails.add(email)
-                seen_addrs.add(addr)
-
-                device_counts[device] += 1
-                addr_counts[addr] += 1
-                email_device_counts[(email, device)] += 1
-
-                unique_devices_per_user[idx[pos]] = float(len(seen_devices))
-                unique_emails_per_card[idx[pos]] = float(len(seen_emails))
-                card_device_count[idx[pos]] = float(device_counts[device])
-                card_addr_count[idx[pos]] = float(addr_counts[addr])
-                email_device_count[idx[pos]] = float(email_device_counts[(email, device)])
-
-        # Fill missing V columns
-        for col in self.V_COLS:
+        # Fill categorical fields consistently.
+        cat_cols = set(self.TXN_CAT_COLS + ["DeviceInfo", "ProductCD", "P_emaildomain", "R_emaildomain"])
+        for col in cat_cols:
             if col in df.columns:
-                df[col] = df[col].fillna(df[col].median())
+                df[col] = df[col].fillna("UNKNOWN").astype(str)
 
         raw_numeric_cols = [
             "TransactionAmt",
@@ -198,41 +132,203 @@ class IEEECISPipeline:
         ]
         for col in raw_numeric_cols:
             if col in df.columns and not isinstance(df[col], pd.DataFrame):
-                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(df[col].median())
+                s = pd.to_numeric(df[col], errors="coerce")
+                train_median = float(s[df["split"] == "train"].median()) if (df["split"] == "train").any() else float(s.median())
+                if np.isnan(train_median):
+                    train_median = 0.0
+                df[col] = s.fillna(train_median)
 
-        # Fill categorical
-        for col in self.TXN_CAT_COLS:
+        # Keep chronological order for rolling feature construction.
+        df = df.sort_values(["card_id", "TransactionDT", "TransactionID"]).reset_index(drop=False)
+        df = df.rename(columns={"index": "_orig_index"})
+
+        n_rows = len(df)
+        one_day = 86400.0
+        seven_days = 7.0 * one_day
+        fourteen_days = 14.0 * one_day
+        thirty_days = 30.0 * one_day
+
+        # Cardholder behavior profile.
+        time_since_last = np.zeros(n_rows, dtype=np.float32)
+        txn_count_1d = np.zeros(n_rows, dtype=np.float32)
+        txn_count_3d = np.zeros(n_rows, dtype=np.float32)
+        txn_count_7d = np.zeros(n_rows, dtype=np.float32)
+        txn_count_14d = np.zeros(n_rows, dtype=np.float32)
+        txn_count_30d = np.zeros(n_rows, dtype=np.float32)
+        amt_mean_7d = np.zeros(n_rows, dtype=np.float32)
+        amt_std_7d = np.zeros(n_rows, dtype=np.float32)
+        amt_max_30d = np.zeros(n_rows, dtype=np.float32)
+        unique_merch_30d = np.zeros(n_rows, dtype=np.float32)
+        unique_device_30d = np.zeros(n_rows, dtype=np.float32)
+        card_age_days = np.zeros(n_rows, dtype=np.float32)
+        card_txn_seq = np.zeros(n_rows, dtype=np.float32)
+        is_new_merchant = np.zeros(n_rows, dtype=np.float32)
+        is_new_device = np.zeros(n_rows, dtype=np.float32)
+        device_first_seen = np.zeros(n_rows, dtype=np.float32)
+        addr_changed = np.zeros(n_rows, dtype=np.float32)
+
+        for _, group in df.groupby("card_id", sort=False):
+            idx = group.index.to_numpy()
+            times = group["TransactionDT"].to_numpy(dtype=np.float64, copy=False)
+            amts = group["TransactionAmt"].to_numpy(dtype=np.float64, copy=False)
+            merch = group["ProductCD"].astype(str).to_numpy()
+            devs = group["device_id"].astype(str).to_numpy()
+            addrs = group["addr_id"].astype(str).to_numpy()
+
+            n_group = len(group)
+            if n_group == 0:
+                continue
+
+            # Sequence position and card age.
+            card_txn_seq[idx] = np.arange(n_group, dtype=np.float32)
+            card_age_days[idx] = ((times - times[0]) / one_day).astype(np.float32)
+
+            if n_group > 1:
+                time_since_last[idx[1:]] = np.diff(times).astype(np.float32, copy=False)
+
+            starts_1d = np.searchsorted(times, times - one_day, side="left")
+            starts_3d = np.searchsorted(times, times - 3.0 * one_day, side="left")
+            starts_7d = np.searchsorted(times, times - seven_days, side="left")
+            starts_14d = np.searchsorted(times, times - fourteen_days, side="left")
+            starts_30d = np.searchsorted(times, times - thirty_days, side="left")
+            positions = np.arange(n_group, dtype=np.float32)
+
+            txn_count_1d[idx] = positions - starts_1d.astype(np.float32)
+            txn_count_3d[idx] = positions - starts_3d.astype(np.float32)
+            txn_count_7d[idx] = positions - starts_7d.astype(np.float32)
+            txn_count_14d[idx] = positions - starts_14d.astype(np.float32)
+            txn_count_30d[idx] = positions - starts_30d.astype(np.float32)
+
+            prefix_sum = np.concatenate([[0.0], np.cumsum(amts, dtype=np.float64)])
+            prefix_sq = np.concatenate([[0.0], np.cumsum(amts * amts, dtype=np.float64)])
+
+            right = np.arange(1, n_group + 1)
+            left_7 = starts_7d.astype(np.int64)
+            count_7 = right - left_7
+            sum_7 = prefix_sum[right] - prefix_sum[left_7]
+            sq_7 = prefix_sq[right] - prefix_sq[left_7]
+            mean_7 = np.divide(sum_7, count_7, out=np.zeros_like(sum_7), where=count_7 > 0)
+            var_7 = np.divide(sq_7, count_7, out=np.zeros_like(sq_7), where=count_7 > 1) - np.square(mean_7)
+            var_7[count_7 <= 1] = 0.0
+            amt_mean_7d[idx] = mean_7.astype(np.float32)
+            amt_std_7d[idx] = np.sqrt(np.clip(var_7, 0.0, None)).astype(np.float32)
+
+            left_30 = starts_30d.astype(np.int64)
+            max_30 = np.zeros(n_group, dtype=np.float32)
+            uniq_merch = np.zeros(n_group, dtype=np.float32)
+            uniq_devs = np.zeros(n_group, dtype=np.float32)
+
+            for i in range(n_group):
+                s = left_30[i]
+                e = i
+                if e <= s:
+                    is_new_merchant[idx[i]] = 1.0
+                    is_new_device[idx[i]] = 1.0
+                    max_30[i] = 0.0
+                    uniq_merch[i] = 0.0
+                    uniq_devs[i] = 0.0
+                    continue
+
+                win_amts = amts[s:e]
+                win_merch = merch[s:e]
+                win_devs = devs[s:e]
+                max_30[i] = float(np.max(win_amts)) if win_amts.size else 0.0
+                uniq_merch[i] = float(len(set(win_merch)))
+                uniq_devs[i] = float(len(set(win_devs)))
+                is_new_merchant[idx[i]] = float(merch[i] not in set(win_merch))
+                is_new_device[idx[i]] = float(devs[i] not in set(win_devs))
+
+            amt_max_30d[idx] = max_30
+            unique_merch_30d[idx] = uniq_merch
+            unique_device_30d[idx] = uniq_devs
+
+            first_addr = addrs[0]
+            addr_changed[idx] = (addrs != first_addr).astype(np.float32)
+
+            seen_device = set()
+            for i, d in enumerate(devs):
+                if d in seen_device:
+                    device_first_seen[idx[i]] = 0.0
+                else:
+                    device_first_seen[idx[i]] = 1.0
+                    seen_device.add(d)
+
+        df["time_since_last_txn"] = time_since_last
+        df["txn_count_1d"] = txn_count_1d
+        df["txn_count_3d"] = txn_count_3d
+        df["txn_count_7d"] = txn_count_7d
+        df["txn_count_14d"] = txn_count_14d
+        df["txn_count_30d"] = txn_count_30d
+        df["amt_mean_7d"] = amt_mean_7d
+        df["amt_std_7d"] = amt_std_7d
+        df["amt_max_30d"] = amt_max_30d
+        df["unique_merch_30d"] = unique_merch_30d
+        df["unique_device_30d"] = unique_device_30d
+        df["is_new_merchant"] = is_new_merchant
+        df["is_new_device"] = is_new_device
+        df["card_age_days"] = card_age_days
+        df["card_txn_seq"] = card_txn_seq
+        df["is_first_5_txns"] = (df["card_txn_seq"] < 5).astype(np.float32)
+
+        # Deviation and velocity features.
+        df["amt_zscore_7d"] = (df["TransactionAmt"] - df["amt_mean_7d"]) / (df["amt_std_7d"] + 1.0)
+        df["amt_to_max_ratio"] = df["TransactionAmt"] / (df["amt_max_30d"] + 1.0)
+        df["vel_1d_7d"] = df["txn_count_1d"] / (df["txn_count_7d"] + 1.0)
+        df["vel_7d_30d"] = df["txn_count_7d"] / (df["txn_count_30d"] + 1.0)
+        df["vel_surge"] = df["txn_count_1d"] / (df["txn_count_30d"] / 30.0 + 1.0)
+
+        # Identity & trust features.
+        df["email_mismatch"] = (df["P_emaildomain"] != df["R_emaildomain"]).astype(np.float32)
+        df["p_email_is_free"] = df["P_emaildomain"].isin(self.FREE_EMAIL_DOMAINS).astype(np.float32)
+        df["r_email_is_free"] = df["R_emaildomain"].isin(self.FREE_EMAIL_DOMAINS).astype(np.float32)
+        df["both_emails_free"] = (df["p_email_is_free"] * df["r_email_is_free"]).astype(np.float32)
+
+        m_match_cols = []
+        for i in range(1, 10):
+            col = f"M{i}"
             if col in df.columns:
-                df[col] = df[col].fillna("UNKNOWN")
+                df[f"{col}_match"] = (df[col] == "T").astype(np.float32)
+                df[f"{col}_known"] = df[col].notna().astype(np.float32)
+                m_match_cols.append(f"{col}_match")
+        if m_match_cols:
+            df["m_match_score"] = df[m_match_cols].sum(axis=1)
+        else:
+            df["m_match_score"] = 0.0
 
-        # Transaction-level engineered features for HTGNN input.
-        feature_df = pd.DataFrame(
-            {
-                "log_amount": np.log1p(df["TransactionAmt"]),
-                "hour": (df["TransactionDT"] // 3600) % 24,
-                "hour_sin": np.sin(2 * np.pi * ((df["TransactionDT"] // 3600) % 24) / 24),
-                "hour_cos": np.cos(2 * np.pi * ((df["TransactionDT"] // 3600) % 24) / 24),
-                "time_since_last_txn": time_since_last,
-                "txn_count_1d": txn_count_1d,
-                "txn_count_7d": txn_count_7d,
-                "txn_count_30d": txn_count_30d,
-                "avg_amt_user": avg_amt_user,
-                "std_amt_user": std_amt_user,
-                "unique_devices_per_user": unique_devices_per_user,
-                "unique_emails_per_card": unique_emails_per_card,
-                "card_device_count": card_device_count,
-                "card_addr_count": card_addr_count,
-                "email_device_count": email_device_count,
-                "card_txn_seq": df.groupby("card_id").cumcount().astype(np.float32),
-            },
-            index=df.index,
-        )
+        df["addr_changed"] = addr_changed
+        df["device_first_seen"] = device_first_seen
 
-        df = pd.concat([df, feature_df], axis=1)
+        # Transaction context features.
+        df["hour"] = ((df["TransactionDT"] // 3600) % 24).astype(np.float32)
+        df["day_of_week"] = ((df["TransactionDT"] // 86400) % 7).astype(np.float32)
+        df["is_weekend"] = (df["day_of_week"] >= 5).astype(np.float32)
+        df["is_night"] = ((df["hour"] >= 22) | (df["hour"] <= 5)).astype(np.float32)
+        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24.0)
+        df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24.0)
+        df["dow_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7.0)
+        df["dow_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7.0)
+        df["log_amount"] = np.log1p(df["TransactionAmt"])
+        df["amount_cents"] = df["TransactionAmt"] % 1.0
+        df["is_round"] = (df["amount_cents"] < 0.01).astype(np.float32)
+
+        train_high_amt = float(df.loc[df["split"] == "train", "TransactionAmt"].quantile(0.9))
+        if np.isnan(train_high_amt):
+            train_high_amt = float(df["TransactionAmt"].quantile(0.9))
+        df["night_highamt"] = df["is_night"] * (df["TransactionAmt"] > train_high_amt).astype(np.float32)
+        df["weekend_newdev"] = df["is_weekend"] * df["is_new_device"]
+
+        # Leakage-safe V-feature median imputation using train partition only.
+        for col in self.V_COLS[: self.max_v_features]:
+            if col in df.columns:
+                median_val = df.loc[df["split"] == "train", col].median()
+                if pd.isna(median_val):
+                    median_val = df[col].median()
+                if pd.isna(median_val):
+                    median_val = 0.0
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(float(median_val))
 
         # Return original order for downstream graph construction.
         df = df.sort_values("_orig_index").drop(columns=["_orig_index"]).reset_index(drop=True)
-
         return df
 
     def build_hetero_data(self, df: pd.DataFrame) -> HeteroData:
@@ -253,26 +349,78 @@ class IEEECISPipeline:
             "log_amount",
             "hour_sin",
             "hour_cos",
+            "dow_sin",
+            "dow_cos",
+            "is_weekend",
+            "is_night",
+            "is_round",
+            "amount_cents",
             "time_since_last_txn",
             "txn_count_1d",
+            "txn_count_3d",
             "txn_count_7d",
+            "txn_count_14d",
             "txn_count_30d",
-            "avg_amt_user",
-            "std_amt_user",
-            "unique_devices_per_user",
-            "unique_emails_per_card",
-            "card_device_count",
-            "card_addr_count",
-            "email_device_count",
+            "amt_mean_7d",
+            "amt_std_7d",
+            "amt_zscore_7d",
+            "amt_max_30d",
+            "amt_to_max_ratio",
+            "unique_merch_30d",
+            "unique_device_30d",
+            "is_new_merchant",
+            "is_new_device",
+            "vel_1d_7d",
+            "vel_7d_30d",
+            "vel_surge",
+            "card_age_days",
             "card_txn_seq",
-        ] + [
-            c for c in self.V_COLS if c in df.columns
-        ]
+            "is_first_5_txns",
+            "email_mismatch",
+            "p_email_is_free",
+            "r_email_is_free",
+            "both_emails_free",
+            "m_match_score",
+            "addr_changed",
+            "device_first_seen",
+            "night_highamt",
+            "weekend_newdev",
+        ] + [c for c in self.V_COLS[: self.max_v_features] if c in df.columns]
         txn_feats = df[txn_feat_cols].fillna(0).to_numpy(dtype=np.float32, copy=False)
         data["txn"].x = torch.from_numpy(txn_feats)
 
+        # Build compact per-transaction history indices to avoid dense [N, K, D] memory.
+        seq_index = np.full((len(df), self.seq_len), -1, dtype=np.int32)
+        delta_t = np.zeros((len(df), self.seq_len), dtype=np.float16)
+        seq_mask = np.ones((len(df), self.seq_len), dtype=bool)
+
+        df_sorted = df[["card_id", "TransactionDT", "TransactionID"]].copy()
+        df_sorted["row_id"] = np.arange(len(df))
+        df_sorted = df_sorted.sort_values(["card_id", "TransactionDT", "TransactionID"]).reset_index(drop=True)
+
+        for _, group in df_sorted.groupby("card_id", sort=False):
+            rows = group["row_id"].to_numpy(dtype=np.int32, copy=False)
+            times = group["TransactionDT"].to_numpy(dtype=np.float64, copy=False)
+            for i, row_id in enumerate(rows):
+                start = max(0, i - self.seq_len)
+                hist_rows = rows[start:i]
+                if hist_rows.size == 0:
+                    continue
+                k = hist_rows.size
+                seq_index[row_id, -k:] = hist_rows
+                delta = (times[i] - times[start:i]).astype(np.float32)
+                delta_t[row_id, -k:] = delta
+                seq_mask[row_id, -k:] = False
+
+        data["txn"].seq_index = torch.from_numpy(seq_index)
+        data["txn"].delta_t = torch.from_numpy(delta_t)
+        data["txn"].seq_mask = torch.from_numpy(seq_mask)
+
+        # ── Training set for aggregates (prevent leakage) ──
+        train_df = df[df["split"] == "train"]
+
         # ── Card features (aggregate per card) ──
-        card_feat = df.groupby("card_id").agg(
+        card_feat = train_df.groupby("card_id").agg(
             avg_amount=("TransactionAmt", "mean"),
             txn_count=("TransactionID", "count"),
             std_amount=("TransactionAmt", "std"),
@@ -281,7 +429,7 @@ class IEEECISPipeline:
         data["card"].x = torch.from_numpy(card_feat)
 
         # ── Merchant features ──
-        merch_feat = df.groupby("ProductCD").agg(
+        merch_feat = train_df.groupby("ProductCD").agg(
             avg_amount=("TransactionAmt", "mean"),
             txn_count=("TransactionID", "count"),
             fraud_rate=("isFraud", "mean"),
@@ -289,7 +437,7 @@ class IEEECISPipeline:
         data["merchant"].x = torch.from_numpy(merch_feat)
 
         # ── Device features ──
-        device_feat = df.groupby("DeviceInfo").agg(
+        device_feat = train_df.groupby("DeviceInfo").agg(
             txn_count=("TransactionID", "count"),
             unique_cards=("card_id", "nunique"),
             fraud_rate=("isFraud", "mean"),
@@ -315,7 +463,7 @@ class IEEECISPipeline:
 
         # card → card (shared device — fraud ring signal)
         # Use grouped pair generation to avoid quadratic memory blowups from self-merges.
-        max_cards_per_device = 50
+        max_cards_per_device = self.max_cards_per_device
         src_parts: List[np.ndarray] = []
         dst_parts: List[np.ndarray] = []
 
@@ -390,13 +538,17 @@ class IEEECISPipeline:
         log.info(f"  Train: {train_mask.sum()}, Val: {val_mask.sum()}, Test: {test_mask.sum()}")
 
         return DatasetSplit(
-            train=data, val=data, test=data,
+            train=data,
+            val=data,
+            test=data,
             metadata={
                 "source": "ieee_cis",
                 "n_txns": len(df),
                 "fraud_rate": float(df["isFraud"].mean()),
                 "n_card_nodes": data["card"].x.shape[0],
                 "n_merchant_nodes": data["merchant"].x.shape[0],
+                "max_v_features": self.max_v_features,
+                "max_cards_per_device": self.max_cards_per_device,
             }
         )
 
@@ -542,10 +694,7 @@ class EllipticPipeline:
         data["txn"].val_mask = torch.from_numpy((t > 34) & (t <= 42))
         data["txn"].test_mask = torch.from_numpy(t > 42)
 
-        return DatasetSplit(
-            train=data, val=data, test=data,
-            metadata={"source": "elliptic", "n_labeled": len(labeled)}
-        )
+        return DatasetSplit(train=data, val=data, test=data, metadata={"source": "elliptic", "n_labeled": len(labeled)})
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -556,6 +705,8 @@ def load_all_datasets(
     data_dir: str,
     datasets: List[str] = None,
     ieee_max_rows: Optional[int] = None,
+    ieee_max_v_features: int = 160,
+    ieee_max_cards_per_device: int = 20,
 ) -> Dict[str, DatasetSplit]:
     """Load and return all available datasets."""
     if datasets is None:
@@ -565,7 +716,10 @@ def load_all_datasets(
 
     pipeline_map = {
         "ieee_cis": lambda: IEEECISPipeline(
-            f"{data_dir}/ieee_cis", max_rows=ieee_max_rows
+            f"{data_dir}/ieee_cis",
+            max_rows=ieee_max_rows,
+            max_v_features=ieee_max_v_features,
+            max_cards_per_device=ieee_max_cards_per_device,
         ).run(),
         "paysim":   lambda: PaySimPipeline(f"{data_dir}/paysim").run(),
         "elliptic": lambda: EllipticPipeline(f"{data_dir}/elliptic").run(),

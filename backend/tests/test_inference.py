@@ -3,7 +3,6 @@ Basic tests for inference and API endpoints.
 Run: pytest tests/ -v
 """
 
-import pytest
 import numpy as np
 from unittest.mock import patch, MagicMock
 from app.ml.inference import score_transaction, _get_risk_level, _pad_features
@@ -52,12 +51,11 @@ def test_score_transaction_probability_range():
         assert 0.0 <= result["fraud_probability"] <= 1.0
 
 
-@pytest.mark.asyncio
-async def test_health_endpoint():
-    from httpx import AsyncClient
+def test_health_endpoint():
+    from fastapi.testclient import TestClient
     from app.main import app
 
-    async with AsyncClient(app=app, base_url="http://test") as client:
-        response = await client.get("/health")
+    with TestClient(app) as client:
+        response = client.get("/health")
         assert response.status_code == 200
         assert response.json()["status"] == "ok"

@@ -34,9 +34,9 @@ class Settings(BaseSettings):
     device: str = "cpu"  # "cuda" if GPU available
 
     # Fraud thresholds
-    fraud_threshold_high: float = 0.60
-    fraud_threshold_medium: float = 0.25
-    fraud_threshold_low: float = 0.15
+    fraud_threshold_high: float = 0.80
+    fraud_threshold_medium: float = 0.50
+    fraud_threshold_low: float = 0.25
 
     # Datasets
     data_dir: str = DEFAULT_DATA_DIR

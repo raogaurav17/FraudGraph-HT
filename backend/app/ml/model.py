@@ -1,13 +1,10 @@
 """
-HTGNN — Heterogeneous Temporal Graph Neural Network
-Core model implementation using PyTorch Geometric.
-
-Architecture:
-    Input → Per-type Linear Projections → Temporal Self-Attention → MLP head
+HTGNN V2 — sequence-first fraud model with graph structural context.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Dict, Tuple
 
 
@@ -34,8 +31,8 @@ class TypeProjection(nn.Module):
         self.layers = nn.ModuleDict({
             ntype: nn.Sequential(
                 nn.Linear(in_ch, hidden),
-                nn.BatchNorm1d(hidden),
-                nn.ReLU(),
+                nn.LayerNorm(hidden),
+                nn.GELU(),
                 nn.Dropout(0.1),
             )
             for ntype, in_ch in in_channels.items()
@@ -52,70 +49,144 @@ class HTGNN(nn.Module):
     Args:
         metadata:     PyG HeteroData metadata (node_types, edge_types)
         in_channels:  {node_type: feature_dim} dict
-        hidden:       hidden dimension (default 128)
+        hidden:       hidden dimension (default 256)
         heads:        attention heads in HANConv (default 4)
-        dropout:      dropout rate (default 0.3)
-        seq_len:      length of temporal transaction sequence (default 10)
+        dropout:      dropout rate (default 0.2)
+        seq_len:      length of temporal transaction sequence (default 15)
     """
 
     def __init__(
         self,
         metadata: Tuple,
         in_channels: Dict[str, int],
-        hidden: int = 128,
+        hidden: int = 256,
         heads: int = 4,
-        dropout: float = 0.3,
-        seq_len: int = 10,
+        dropout: float = 0.2,
+        seq_len: int = 15,
     ):
         super().__init__()
         self.hidden = hidden
         self.seq_len = seq_len
+        self.metadata = metadata
 
-        # 1. Type-specific projections
-        self.proj = TypeProjection(in_channels, hidden)
+        txn_in_dim = int(in_channels.get("txn", hidden))
+        card_in_dim = int(in_channels.get("card", txn_in_dim))
+        seq_in_dim = txn_in_dim
 
-        # 2. Temporal encoding
-        self.time_enc = FourierTimeEncoding(hidden)
-        self.temporal_proj = nn.Linear(hidden, hidden)
-
-        # 3. Temporal self-attention
-        self.temporal_attn = nn.MultiheadAttention(
-            hidden, num_heads=4, dropout=dropout, batch_first=True
-        )
-
-        # Gating: combine graph embedding with temporal context
-        self.gate = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
-            nn.Sigmoid(),
-        )
-
-        # 4. Fraud classification head
-        self.head = nn.Sequential(
-            nn.Linear(hidden * 2, 64),
-            nn.ReLU(),
+        self.txn_encoder = nn.Sequential(
+            nn.Linear(txn_in_dim, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+        )
+
+        self.seq_input = nn.Linear(seq_in_dim, hidden)
+        self.seq_time_enc = FourierTimeEncoding(hidden)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden,
+            nhead=max(1, heads),
+            dim_feedforward=hidden * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.seq_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden))
+
+        self.node_proj = nn.ModuleDict({
+            ntype: nn.Linear(dim, hidden)
+            for ntype, dim in in_channels.items()
+        })
+
+        self.use_han = False
+        self.han1 = None
+        self.han2 = None
+        try:
+            from torch_geometric.nn import HANConv
+
+            self.han1 = HANConv(hidden, hidden, metadata, heads=max(1, heads), dropout=dropout)
+            self.han2 = HANConv(hidden, hidden, metadata, heads=max(1, heads), dropout=dropout)
+            self.use_han = True
+        except Exception:
+            self.use_han = False
+
+        self.graph_norm1 = nn.LayerNorm(hidden)
+        self.graph_norm2 = nn.LayerNorm(hidden)
+
+        self.cross_attn = nn.MultiheadAttention(
+            hidden,
+            num_heads=max(1, heads),
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        self.head = nn.Sequential(
+            nn.Linear(hidden * 2, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 64),
+            nn.GELU(),
             nn.Linear(64, 1),
         )
 
         self._init_weights()
 
-    def _aggregate_mean(
+    def _encode_sequence(
         self,
-        source_embeddings: torch.Tensor,
-        edge_index: torch.Tensor,
-        num_dest_nodes: int,
+        txn_seq: Optional[torch.Tensor],
+        delta_t: Optional[torch.Tensor],
+        seq_mask: Optional[torch.Tensor],
+        batch_size: int,
+        device: torch.device,
     ) -> torch.Tensor:
-        if edge_index is None or edge_index.numel() == 0:
-            return source_embeddings.new_zeros((num_dest_nodes, source_embeddings.size(-1)))
+        if txn_seq is None or delta_t is None:
+            return torch.zeros((batch_size, self.hidden), dtype=torch.float32, device=device)
 
-        source_index = edge_index[0].long()
-        dest_index = edge_index[1].long()
-        aggregated = source_embeddings.new_zeros((num_dest_nodes, source_embeddings.size(-1)))
-        aggregated.index_add_(0, dest_index, source_embeddings[source_index])
+        if txn_seq.ndim != 3:
+            return torch.zeros((batch_size, self.hidden), dtype=torch.float32, device=device)
 
-        counts = source_embeddings.new_zeros(num_dest_nodes)
-        counts.index_add_(0, dest_index, torch.ones_like(dest_index, dtype=source_embeddings.dtype))
-        return aggregated / counts.clamp_min(1.0).unsqueeze(-1)
+        x = self.seq_input(txn_seq.float()) + self.seq_time_enc(delta_t.float())
+        cls = self.cls_token.expand(x.size(0), -1, -1)
+        x = torch.cat([cls, x], dim=1)
+
+        if seq_mask is None:
+            seq_mask = torch.zeros((x.size(0), x.size(1) - 1), dtype=torch.bool, device=x.device)
+        cls_mask = torch.zeros((x.size(0), 1), dtype=torch.bool, device=x.device)
+        full_mask = torch.cat([cls_mask, seq_mask.bool()], dim=1)
+        out = self.seq_encoder(x, src_key_padding_mask=full_mask)
+        return out[:, 0]
+
+    def _encode_graph(
+        self,
+        x_dict: Dict[str, torch.Tensor],
+        edge_index_dict: Dict,
+    ) -> Dict[str, torch.Tensor]:
+        proj = {
+            ntype: self.node_proj[ntype](x)
+            for ntype, x in x_dict.items()
+            if ntype in self.node_proj
+        }
+
+        if not self.use_han or self.han1 is None or self.han2 is None:
+            return proj
+
+        edge_subset = {}
+        for edge_type, edge_index in edge_index_dict.items():
+            src_type, _, dst_type = edge_type
+            if src_type in proj and dst_type in proj:
+                edge_subset[edge_type] = edge_index
+
+        if not edge_subset:
+            return proj
+
+        h = self.han1(proj, edge_subset)
+        h = {k: F.relu(self.graph_norm1(v)) for k, v in h.items()}
+        h = self.han2(h, edge_subset)
+        h = {k: self.graph_norm2(v) for k, v in h.items()}
+        return h
 
     def _init_weights(self):
         for m in self.modules():
@@ -128,62 +199,43 @@ class HTGNN(nn.Module):
         self,
         x_dict: Dict[str, torch.Tensor],
         edge_index_dict: Dict,
-        txn_seq: Optional[torch.Tensor] = None,   # [B, seq_len, hidden]
-        delta_t: Optional[torch.Tensor] = None,    # [B, seq_len] time deltas
+        txn_seq: Optional[torch.Tensor] = None,   # [N, seq_len, input_dim]
+        delta_t: Optional[torch.Tensor] = None,   # [N, seq_len] time deltas
+        seq_mask: Optional[torch.Tensor] = None,  # [N, seq_len] true for padding
         return_embeddings: bool = False,
     ) -> torch.Tensor:
-        # ── 1. Type projection ──
-        h = self.proj(x_dict)
-        txn_emb = h["txn"]
+        txn_x = x_dict.get("txn")
+        if txn_x is None:
+            raise ValueError("x_dict must contain 'txn' node features")
 
-        graph_contexts = []
-        card_txn_edge = edge_index_dict.get(("card", "makes", "txn"))
-        if card_txn_edge is not None and "card" in h:
-            graph_contexts.append(self._aggregate_mean(h["card"], card_txn_edge, txn_emb.size(0)))
+        txn_emb = self.txn_encoder(txn_x)
+        n_txn = txn_emb.size(0)
 
-        txn_merchant_edge = edge_index_dict.get(("txn", "at", "merchant"))
-        if txn_merchant_edge is not None and "merchant" in h:
-            graph_contexts.append(
-                self._aggregate_mean(h["merchant"], txn_merchant_edge.flip(0), txn_emb.size(0))
-            )
+        seq_ctx = self._encode_sequence(
+            txn_seq=txn_seq,
+            delta_t=delta_t,
+            seq_mask=seq_mask,
+            batch_size=n_txn,
+            device=txn_emb.device,
+        )
 
-        txn_device_edge = edge_index_dict.get(("txn", "via", "device"))
-        if txn_device_edge is not None and "device" in h:
-            graph_contexts.append(
-                self._aggregate_mean(h["device"], txn_device_edge.flip(0), txn_emb.size(0))
-            )
-
-        if edge_index_dict.get(("card", "shared_device", "card")) is not None and "card" in h:
-            shared_card_context = self._aggregate_mean(
-                h["card"],
-                edge_index_dict[("card", "shared_device", "card")],
-                h["card"].size(0),
-            )
-            if card_txn_edge is not None:
-                graph_contexts.append(self._aggregate_mean(shared_card_context, card_txn_edge, txn_emb.size(0)))
-
-        if graph_contexts:
-            graph_ctx = torch.stack(graph_contexts, dim=0).mean(dim=0)
-        else:
+        graph_dict = self._encode_graph(x_dict, edge_index_dict)
+        graph_ctx = graph_dict.get("txn")
+        if graph_ctx is None:
             graph_ctx = torch.zeros_like(txn_emb)
 
-        # ── 2. Temporal attention ──
-        temporal_ctx = torch.zeros_like(txn_emb)
-        if txn_seq is not None and delta_t is not None:
-            seq = self.temporal_proj(txn_seq) + self.time_enc(delta_t)
-            seq, _ = self.temporal_attn(seq, seq, seq)
-            temporal_ctx = seq.mean(dim=1)
-
-        ctx = graph_ctx + temporal_ctx
-
-        # Gate: how much temporal context to use
-        g = self.gate(torch.cat([txn_emb, ctx], dim=-1))
-        fused = torch.cat([txn_emb, g * ctx], dim=-1)    # [B, hidden*2]
+        context = torch.stack([seq_ctx, graph_ctx], dim=1)
+        fused_attn, _ = self.cross_attn(
+            txn_emb.unsqueeze(1),
+            context,
+            context,
+        )
+        fused_attn = fused_attn.squeeze(1)
+        fused = torch.cat([txn_emb, fused_attn], dim=-1)
 
         if return_embeddings:
             return fused
 
-        # ── 4. Classification ──
         logits = self.head(fused).squeeze(-1)
         return logits
 
@@ -197,8 +249,8 @@ def build_model(metadata, in_channels: Dict[str, int], **kwargs) -> HTGNN:
     return HTGNN(
         metadata=metadata,
         in_channels=in_channels,
-        hidden=kwargs.get("hidden", 128),
+        hidden=kwargs.get("hidden", 256),
         heads=kwargs.get("heads", 4),
-        dropout=kwargs.get("dropout", 0.3),
-        seq_len=kwargs.get("seq_len", 10),
+        dropout=kwargs.get("dropout", 0.2),
+        seq_len=kwargs.get("seq_len", 15),
     )

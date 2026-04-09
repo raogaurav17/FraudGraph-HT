@@ -20,6 +20,21 @@ settings = get_settings()
 _model_cache: Optional[Dict] = None
 
 
+def _load_compatible_state_dict(model: torch.nn.Module, state_dict: Dict[str, torch.Tensor]) -> bool:
+    """Load only parameters whose keys and shapes match the current model."""
+    model_state = model.state_dict()
+    compatible_state = {
+        key: tensor
+        for key, tensor in state_dict.items()
+        if key in model_state and model_state[key].shape == tensor.shape
+    }
+    if not compatible_state:
+        return False
+
+    model.load_state_dict(compatible_state, strict=False)
+    return True
+
+
 def load_model(model_path: str = None) -> Dict:
     global _model_cache
     if _model_cache is not None:
@@ -38,7 +53,16 @@ def load_model(model_path: str = None) -> Dict:
         checkpoint["in_channels"],
         **checkpoint.get("hyperparams", {}),
     )
-    model.load_state_dict(checkpoint["model_state"])
+    try:
+        model.load_state_dict(checkpoint["model_state"])
+    except RuntimeError as exc:
+        log.warning("Model checkpoint is not fully compatible with current architecture: %s", exc)
+        loaded = _load_compatible_state_dict(model, checkpoint.get("model_state", {}))
+        if not loaded:
+            log.warning("Falling back to demo model because no compatible weights could be loaded.")
+            demo_cache = _create_demo_model()
+            _model_cache = demo_cache
+            return demo_cache
     model.eval()
 
     _model_cache = {

@@ -130,17 +130,59 @@ def predict_logits(
     mask_key: str,
     device: torch.device,
     node_type: str = "txn",
+    num_neighbors: Optional[Dict] = None,
+    eval_batch_size: int = 512,
 ) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
+    mask = getattr(data[node_type], mask_key)
+    neighbors = num_neighbors or {rel: [8, 4] for rel in data.metadata()[1]}
+    eval_loader = NeighborLoader(
+        data,
+        num_neighbors=neighbors,
+        batch_size=eval_batch_size,
+        input_nodes=(node_type, mask),
+        shuffle=False,
+    )
+
+    full_txn_x = data[node_type].x
+    full_seq_index = getattr(data[node_type], "seq_index", None)
+    full_delta_t = getattr(data[node_type], "delta_t", None)
+    full_seq_mask = getattr(data[node_type], "seq_mask", None)
+
+    all_logits, all_labels = [], []
     with torch.no_grad():
-        # For simplicity: full-graph inference (use NeighborLoader in production)
-        logits = model(
-            {k: v.to(device) for k, v in data.x_dict.items()},
-            {k: v.to(device) for k, v in data.edge_index_dict.items()},
-        )
-        mask = getattr(data[node_type], mask_key)
-        y_true = data[node_type].y[mask].numpy()
-        y_logits = logits[mask].detach().cpu().numpy()
+        for batch in eval_loader:
+            batch = batch.to(device)
+            n_seed = batch[node_type].batch_size
+            txn_seq, delta_t, seq_mask = build_batch_sequence_inputs(
+                batch=batch,
+                node_type=node_type,
+                full_txn_x=full_txn_x,
+                full_seq_index=full_seq_index,
+                full_delta_t=full_delta_t,
+                full_seq_mask=full_seq_mask,
+                device=device,
+            )
+            logits = model(
+                batch.x_dict,
+                batch.edge_index_dict,
+                txn_seq=txn_seq,
+                delta_t=delta_t,
+                seq_mask=seq_mask,
+            )[:n_seed]
+            if logits.ndim > 1:
+                logits = logits.squeeze(-1)
+            labels = batch[node_type].y[:n_seed]
+            all_logits.append(logits.cpu())
+            all_labels.append(labels.cpu())
+
+            # Release batch-scoped tensors early to lower peak memory.
+            del batch, txn_seq, delta_t, seq_mask, logits, labels
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    
+    y_logits = torch.cat(all_logits).numpy()
+    y_true = torch.cat(all_labels).numpy()
     return y_true.astype(int), y_logits.astype(float)
 
 
@@ -221,6 +263,11 @@ def train_epoch(
     loss_fn: LossFn,
     device: torch.device,
     node_type: str = "txn",
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
+    full_txn_x: Optional[torch.Tensor] = None,
+    full_seq_index: Optional[torch.Tensor] = None,
+    full_delta_t: Optional[torch.Tensor] = None,
+    full_seq_mask: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -228,36 +275,103 @@ def train_epoch(
 
     for batch in loader:
         batch = batch.to(device)
-        logits = model(batch.x_dict, batch.edge_index_dict)
-        labels = batch[node_type].y.float()
+        n_seed = batch[node_type].batch_size
+        txn_seq, delta_t, seq_mask = build_batch_sequence_inputs(
+            batch=batch,
+            node_type=node_type,
+            full_txn_x=full_txn_x,
+            full_seq_index=full_seq_index,
+            full_delta_t=full_delta_t,
+            full_seq_mask=full_seq_mask,
+            device=device,
+        )
+        logits = model(
+            batch.x_dict,
+            batch.edge_index_dict,
+            txn_seq=txn_seq,
+            delta_t=delta_t,
+            seq_mask=seq_mask,
+        )[:n_seed]
+        if logits.ndim > 1:
+            logits = logits.squeeze(-1)
+        labels = batch[node_type].y[:n_seed].float()
         loss = loss_fn(logits, labels)
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         n_batches += 1
 
+        # Release batch-scoped tensors early to lower peak memory.
+        del batch, txn_seq, delta_t, seq_mask, logits, labels, loss
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     return {"loss": total_loss / max(n_batches, 1)}
+
+
+def build_batch_sequence_inputs(
+    batch,
+    node_type: str,
+    full_txn_x: Optional[torch.Tensor],
+    full_seq_index: Optional[torch.Tensor],
+    full_delta_t: Optional[torch.Tensor],
+    full_seq_mask: Optional[torch.Tensor],
+    device: torch.device,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Materialize [B, K, D] sequence tensors only for seed nodes in the current batch."""
+    if (
+        full_txn_x is None
+        or full_seq_index is None
+        or full_delta_t is None
+        or full_seq_mask is None
+        or not hasattr(batch[node_type], "n_id")
+    ):
+        return None, None, None
+
+    n_seed = int(batch[node_type].batch_size)
+    global_seed_ids = batch[node_type].n_id[:n_seed].detach().cpu()
+
+    seq_index = full_seq_index.index_select(0, global_seed_ids)
+    delta_t = full_delta_t.index_select(0, global_seed_ids)
+    seq_mask = full_seq_mask.index_select(0, global_seed_ids)
+
+    seq_len = seq_index.size(1)
+    safe_index = seq_index.clamp(min=0)
+    flat_index = safe_index.reshape(-1)
+    txn_seq = full_txn_x.index_select(0, flat_index).reshape(n_seed, seq_len, -1)
+
+    # Zero-out padded positions so clamped index values do not leak signal.
+    txn_seq = txn_seq * (~seq_mask).unsqueeze(-1).float()
+
+    return txn_seq.to(device), delta_t.to(device), seq_mask.to(device)
 
 
 def train(
     dataset_name: str = "ieee_cis",
     epochs: int = 50,
-    hidden: int = 128,
+    hidden: int = 192,
     heads: int = 4,
-    dropout: float = 0.3,
-    lr: float = 1e-3,
+    dropout: float = 0.2,
+    lr: float = 3e-4,
     weight_decay: float = 1e-4,
-    batch_size: int = 512,
+    batch_size: int = 128,
     patience: int = 8,
-    loss_name: str = "focal",
-    focal_alpha: float = 0.25,
+    loss_name: str = "v2_focal",
+    focal_alpha: float = 0.9,
     focal_gamma: float = 2.0,
+    smoothing: float = 0.05,
     pos_weight: Optional[float] = None,
     max_rows: Optional[int] = None,
+    max_v_features: int = 160,
+    max_cards_per_device: int = 20,
+    neighbor_hop1: int = 6,
+    neighbor_hop2: int = 3,
     save_path: Optional[str] = None,
     artifacts_dir: Optional[str] = None,
     logs_dir: Optional[str] = None,
@@ -279,6 +393,8 @@ def train(
         settings.data_dir,
         dataset_list,
         ieee_max_rows=max_rows if dataset_name == "ieee_cis" else None,
+        ieee_max_v_features=max_v_features,
+        ieee_max_cards_per_device=max_cards_per_device,
     )
 
     if not datasets:
@@ -347,32 +463,54 @@ def train(
 
     # ── Data loader ──
     train_mask = data[node_type].train_mask
+    neighbor_sizes = {
+        rel: [max(1, int(neighbor_hop1)), max(1, int(neighbor_hop2))]
+        for rel in data.metadata()[1]
+    }
     loader = NeighborLoader(
         data,
-        num_neighbors={rel: [16, 8] for rel in data.metadata()[1]},
+        num_neighbors=neighbor_sizes,
         batch_size=batch_size,
         input_nodes=(node_type, train_mask),
         shuffle=True,
     )
 
+    full_txn_x = data[node_type].x
+    full_seq_index = getattr(data[node_type], "seq_index", None)
+    full_delta_t = getattr(data[node_type], "delta_t", None)
+    full_seq_mask = getattr(data[node_type], "seq_mask", None)
+    train_labels = data[node_type].y[train_mask].float()
     effective_pos_weight = pos_weight
     if loss_name == "weighted_bce" and effective_pos_weight is None:
-        train_labels = data[node_type].y[train_mask].float()
         positives = float(train_labels.sum().item())
         negatives = float(train_labels.numel() - positives)
         effective_pos_weight = negatives / max(positives, 1.0)
         log.info(f"Auto-computed pos_weight={effective_pos_weight:.4f} from train split")
 
+    effective_focal_alpha = focal_alpha
+    if loss_name == "focal" and focal_alpha == 0.25:
+        fraud_rate = float(train_labels.mean().item())
+        effective_focal_alpha = 1.0 - fraud_rate
+        log.info(f"Auto-computed focal_alpha={effective_focal_alpha:.4f} from train split")
+
+
     loss_fn = build_loss_fn(
         loss_name=loss_name,
-        focal_alpha=focal_alpha,
+        focal_alpha=effective_focal_alpha,
         focal_gamma=focal_gamma,
         pos_weight=effective_pos_weight,
+        smoothing=smoothing,
     )
     log.info(f"Using loss function: {loss_name}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        steps_per_epoch=max(len(loader), 1),
+        epochs=epochs,
+        pct_start=0.1,
+    )
     early_stop = EarlyStopping(patience=patience)
 
     best_val_auprc = 0.0
@@ -382,9 +520,20 @@ def train(
     # ── Training loop ──
     for epoch in range(1, epochs + 1):
         t0 = time.time()
-        train_metrics = train_epoch(model, loader, optimizer, loss_fn, device, node_type)
+        train_metrics = train_epoch(
+            model,
+            loader,
+            optimizer,
+            loss_fn,
+            device,
+            node_type,
+            scheduler=scheduler,
+            full_txn_x=full_txn_x,
+            full_seq_index=full_seq_index,
+            full_delta_t=full_delta_t,
+            full_seq_mask=full_seq_mask,
+        )
         val_metrics = evaluate(model, data, "val_mask", device, node_type)
-        scheduler.step()
 
         epoch_time = time.time() - t0
         log.info(
@@ -414,7 +563,14 @@ def train(
     if best_state:
         model.load_state_dict(best_state)
 
-    val_y_true, val_logits = predict_logits(model, data, "val_mask", device, node_type)
+    val_y_true, val_logits = predict_logits(
+        model,
+        data,
+        "val_mask",
+        device,
+        node_type,
+        num_neighbors=neighbor_sizes,
+    )
     calibration = fit_platt_scaler(val_logits, val_y_true)
     val_y_score = apply_platt_scaling(val_logits, calibration)
 
@@ -432,7 +588,14 @@ def train(
         best_val_threshold_metrics["f1"],
     )
 
-    test_y_true, test_logits = predict_logits(model, data, "test_mask", device, node_type)
+    test_y_true, test_logits = predict_logits(
+        model,
+        data,
+        "test_mask",
+        device,
+        node_type,
+        num_neighbors=neighbor_sizes,
+    )
     test_y_score = apply_platt_scaling(test_logits, calibration)
     test_metrics = compute_metrics_from_scores(test_y_true, test_y_score, best_threshold)
     log.info(f"Test metrics: {test_metrics}")
@@ -449,7 +612,7 @@ def train(
             "heads": heads,
             "dropout": dropout,
             "loss_name": loss_name,
-            "focal_alpha": focal_alpha,
+            "focal_alpha": effective_focal_alpha,
             "focal_gamma": focal_gamma,
             "pos_weight": effective_pos_weight,
         },
@@ -524,16 +687,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="ieee_cis")
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--hidden", type=int, default=128)
+    parser.add_argument("--hidden", type=int, default=192)
     parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--loss", choices=list(AVAILABLE_LOSSES), default="focal")
-    parser.add_argument("--focal-alpha", type=float, default=0.25)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--loss", choices=list(AVAILABLE_LOSSES), default="v2_focal")
+    parser.add_argument("--focal-alpha", type=float, default=0.9)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument("--smoothing", type=float, default=0.05)
     parser.add_argument("--pos-weight", type=float, default=None)
     parser.add_argument("--max-rows", type=int, default=None)
+    parser.add_argument("--max-v-features", type=int, default=160)
+    parser.add_argument("--max-cards-per-device", type=int, default=20)
+    parser.add_argument("--neighbor-hop1", type=int, default=6)
+    parser.add_argument("--neighbor-hop2", type=int, default=3)
     parser.add_argument("--save-path", default=None)
     parser.add_argument("--artifacts-dir", default='artifacts')
     parser.add_argument("--logs-dir", default=None)
@@ -550,8 +718,13 @@ if __name__ == "__main__":
         loss_name=args.loss,
         focal_alpha=args.focal_alpha,
         focal_gamma=args.focal_gamma,
+        smoothing=args.smoothing,
         pos_weight=args.pos_weight,
         max_rows=args.max_rows,
+        max_v_features=args.max_v_features,
+        max_cards_per_device=args.max_cards_per_device,
+        neighbor_hop1=args.neighbor_hop1,
+        neighbor_hop2=args.neighbor_hop2,
         save_path=args.save_path,
         artifacts_dir=args.artifacts_dir,
         logs_dir=args.logs_dir,

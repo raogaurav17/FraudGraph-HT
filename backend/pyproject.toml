@@ -19,6 +19,8 @@ dependencies = [
     "passlib[bcrypt]>=1.7.4",
     "prometheus-client>=0.24.1",
     "pyarrow>=23.0.1",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.2.0",
     "python-jose[cryptography]>=3.5.0",
     "redis>=7.4.0",
     "rich>=14.3.3",
@@ -32,6 +34,9 @@ dependencies = [
     "tqdm>=4.67.3",
     "typer>=0.24.1",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.uv.extra-build-dependencies]
 torch-scatter = ["torch"]

@@ -12,7 +12,14 @@ import torch.nn.functional as F
 
 LossFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 
-AVAILABLE_LOSSES = ("focal", "bce", "weighted_bce", "dice")
+AVAILABLE_LOSSES = (
+    "focal",
+    "bce",
+    "weighted_bce",
+    "dice",
+    "v2_focal",
+    "weighted_focal_smooth",
+)
 
 
 def focal_loss(
@@ -77,11 +84,28 @@ def dice_loss(
     return 1.0 - score
 
 
+def weighted_focal_smooth_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    alpha: float = 0.9,
+    gamma: float = 2.0,
+    smoothing: float = 0.05,
+) -> torch.Tensor:
+    """Weighted focal loss with label smoothing for noisy, imbalanced fraud labels."""
+    labels = labels.float()
+    labels_smooth = labels * (1.0 - smoothing) + 0.5 * smoothing
+    bce = F.binary_cross_entropy_with_logits(logits, labels_smooth, reduction="none")
+    pt = torch.exp(-bce)
+    loss = alpha * (1.0 - pt).pow(gamma) * bce
+    return loss.mean()
+
+
 def build_loss_fn(
     loss_name: str,
     focal_alpha: float = 0.25,
     focal_gamma: float = 2.0,
     pos_weight: float | None = None,
+    smoothing: float = 0.05,
 ) -> LossFn:
     """Build a callable loss function based on name and hyperparameters."""
     name = loss_name.lower().strip()
@@ -108,6 +132,15 @@ def build_loss_fn(
 
     if name == "dice":
         return dice_loss
+
+    if name in ("v2_focal", "weighted_focal_smooth"):
+        return lambda logits, labels: weighted_focal_smooth_loss(
+            logits,
+            labels,
+            alpha=focal_alpha,
+            gamma=focal_gamma,
+            smoothing=smoothing,
+        )
 
     available = ", ".join(AVAILABLE_LOSSES)
     raise ValueError(f"Unsupported loss function '{loss_name}'. Available: {available}")
