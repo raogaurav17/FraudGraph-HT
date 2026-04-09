@@ -21,6 +21,7 @@ from datetime import datetime
 
 import torch
 import numpy as np
+import torch.nn.functional as F
 from torch_geometric.loader import NeighborLoader
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -262,6 +263,138 @@ def sweep_thresholds(
     return best_threshold, best_metrics, scan_rows
 
 
+def _drop_edges(edge_index_dict: Dict, drop_prob: float) -> Dict:
+    """Randomly drop edges for graph-view augmentation during SSL."""
+    if drop_prob <= 0:
+        return edge_index_dict
+
+    out = {}
+    for rel, edge_index in edge_index_dict.items():
+        if edge_index.size(1) <= 1:
+            out[rel] = edge_index
+            continue
+
+        keep_mask = torch.rand(edge_index.size(1), device=edge_index.device) > drop_prob
+        if not bool(keep_mask.any()):
+            keep_mask[0] = True
+        out[rel] = edge_index[:, keep_mask]
+    return out
+
+
+def _mask_features(x_dict: Dict[str, torch.Tensor], mask_prob: float) -> Dict[str, torch.Tensor]:
+    """Randomly mask node features for graph-view augmentation during SSL."""
+    if mask_prob <= 0:
+        return x_dict
+
+    out = {}
+    for ntype, features in x_dict.items():
+        if not torch.is_floating_point(features):
+            out[ntype] = features
+            continue
+        mask = (torch.rand_like(features) > mask_prob).to(features.dtype)
+        out[ntype] = features * mask
+    return out
+
+
+def _info_nce_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torch.Tensor:
+    """Symmetric InfoNCE for paired embeddings from two graph views."""
+    bsz = z1.size(0)
+    if bsz <= 1:
+        return torch.tensor(0.0, device=z1.device)
+
+    logits = torch.matmul(z1, z2.T) / max(temperature, 1e-6)
+    labels = torch.arange(bsz, device=z1.device)
+    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+
+
+def _compute_ssl_loss(
+    model: HTGNN,
+    batch,
+    node_type: str,
+    n_seed: int,
+    txn_seq: Optional[torch.Tensor],
+    delta_t: Optional[torch.Tensor],
+    seq_mask: Optional[torch.Tensor],
+    edge_drop_prob: float,
+    feature_mask_prob: float,
+    ssl_temperature: float,
+) -> torch.Tensor:
+    """Compute contrastive SSL loss using two augmented graph views."""
+    x_view1 = _mask_features(batch.x_dict, feature_mask_prob)
+    x_view2 = _mask_features(batch.x_dict, feature_mask_prob)
+    e_view1 = _drop_edges(batch.edge_index_dict, edge_drop_prob)
+    e_view2 = _drop_edges(batch.edge_index_dict, edge_drop_prob)
+
+    emb1 = model.encode(
+        x_view1,
+        e_view1,
+        txn_seq=txn_seq,
+        delta_t=delta_t,
+        seq_mask=seq_mask,
+    )[:n_seed]
+    emb2 = model.encode(
+        x_view2,
+        e_view2,
+        txn_seq=txn_seq,
+        delta_t=delta_t,
+        seq_mask=seq_mask,
+    )[:n_seed]
+    z1 = model.project(emb1)
+    z2 = model.project(emb2)
+    return _info_nce_loss(z1, z2, ssl_temperature)
+
+
+def _compute_adversarial_loss(
+    model: HTGNN,
+    batch,
+    node_type: str,
+    n_seed: int,
+    labels: torch.Tensor,
+    loss_fn: LossFn,
+    txn_seq: Optional[torch.Tensor],
+    delta_t: Optional[torch.Tensor],
+    seq_mask: Optional[torch.Tensor],
+    adv_epsilon: float,
+) -> torch.Tensor:
+    """Compute FGSM adversarial loss by perturbing txn node features."""
+    base_x = dict(batch.x_dict)
+    txn_x = base_x[node_type].detach().clone().requires_grad_(True)
+    grad_x = dict(base_x)
+    grad_x[node_type] = txn_x
+
+    logits_for_grad = model(
+        grad_x,
+        batch.edge_index_dict,
+        txn_seq=txn_seq,
+        delta_t=delta_t,
+        seq_mask=seq_mask,
+    )[:n_seed]
+    if logits_for_grad.ndim > 1:
+        logits_for_grad = logits_for_grad.squeeze(-1)
+    sup_for_grad = loss_fn(logits_for_grad, labels)
+    grad = torch.autograd.grad(
+        sup_for_grad,
+        txn_x,
+        retain_graph=False,
+        create_graph=False,
+        allow_unused=False,
+    )[0]
+
+    perturbed_txn_x = txn_x.detach() + adv_epsilon * grad.sign().detach()
+    adv_x = dict(base_x)
+    adv_x[node_type] = perturbed_txn_x
+    adv_logits = model(
+        adv_x,
+        batch.edge_index_dict,
+        txn_seq=txn_seq,
+        delta_t=delta_t,
+        seq_mask=seq_mask,
+    )[:n_seed]
+    if adv_logits.ndim > 1:
+        adv_logits = adv_logits.squeeze(-1)
+    return loss_fn(adv_logits, labels)
+
+
 def train_epoch(
     model: HTGNN,
     loader: NeighborLoader,
@@ -274,9 +407,18 @@ def train_epoch(
     full_seq_index: Optional[torch.Tensor] = None,
     full_delta_t: Optional[torch.Tensor] = None,
     full_seq_mask: Optional[torch.Tensor] = None,
+    lambda_ssl: float = 0.1,
+    lambda_adv: float = 0.3,
+    ssl_temperature: float = 0.2,
+    edge_drop_prob: float = 0.1,
+    feature_mask_prob: float = 0.1,
+    adv_epsilon: float = 0.01,
 ) -> Dict[str, float]:
     model.train()
     total_loss = 0.0
+    total_sup_loss = 0.0
+    total_ssl_loss = 0.0
+    total_adv_loss = 0.0
     n_batches = 0
     skipped_batches = 0
 
@@ -316,12 +458,45 @@ def train_epoch(
             logits = logits[finite_rows]
             labels = labels[finite_rows]
 
-        loss = loss_fn(logits, labels)
+        sup_loss = loss_fn(logits, labels)
+        loss = sup_loss
+
+        ssl_loss = torch.tensor(0.0, device=device)
+        if lambda_ssl > 0:
+            ssl_loss = _compute_ssl_loss(
+                model=model,
+                batch=batch,
+                node_type=node_type,
+                n_seed=n_seed,
+                txn_seq=txn_seq,
+                delta_t=delta_t,
+                seq_mask=seq_mask,
+                edge_drop_prob=edge_drop_prob,
+                feature_mask_prob=feature_mask_prob,
+                ssl_temperature=ssl_temperature,
+            )
+            loss = loss + lambda_ssl * ssl_loss
+
+        adv_loss = torch.tensor(0.0, device=device)
+        if lambda_adv > 0 and adv_epsilon > 0:
+            adv_loss = _compute_adversarial_loss(
+                model=model,
+                batch=batch,
+                node_type=node_type,
+                n_seed=n_seed,
+                labels=labels,
+                loss_fn=loss_fn,
+                txn_seq=txn_seq,
+                delta_t=delta_t,
+                seq_mask=seq_mask,
+                adv_epsilon=adv_epsilon,
+            )
+            loss = loss + lambda_adv * adv_loss
 
         if not torch.isfinite(loss):
             skipped_batches += 1
             log.warning("Skipping batch with non-finite loss")
-            del batch, txn_seq, delta_t, seq_mask, logits, labels, loss
+            del batch, txn_seq, delta_t, seq_mask, logits, labels, loss, sup_loss, ssl_loss, adv_loss
             continue
 
         optimizer.zero_grad()
@@ -330,17 +505,25 @@ def train_epoch(
         optimizer.step()
 
         total_loss += loss.item()
+        total_sup_loss += sup_loss.item()
+        total_ssl_loss += ssl_loss.item()
+        total_adv_loss += adv_loss.item()
         n_batches += 1
 
         # Release batch-scoped tensors early to lower peak memory.
-        del batch, txn_seq, delta_t, seq_mask, logits, labels, loss
+        del batch, txn_seq, delta_t, seq_mask, logits, labels, loss, sup_loss, ssl_loss, adv_loss
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     avg_loss = total_loss / max(n_batches, 1)
     if skipped_batches:
         log.warning("Skipped %d training batches due to non-finite values", skipped_batches)
-    return {"loss": avg_loss}
+    return {
+        "loss": avg_loss,
+        "sup_loss": total_sup_loss / max(n_batches, 1),
+        "ssl_loss": total_ssl_loss / max(n_batches, 1),
+        "adv_loss": total_adv_loss / max(n_batches, 1),
+    }
 
 
 def build_batch_sequence_inputs(
@@ -404,6 +587,12 @@ def train(
     neighbor_hop2: int = 8,
     feature_mode: str = "enhanced",
     pos_oversample_factor: int = 1,
+    lambda_ssl: float = 0.1,
+    lambda_adv: float = 0.3,
+    ssl_temperature: float = 0.2,
+    edge_drop_prob: float = 0.1,
+    feature_mask_prob: float = 0.1,
+    adv_epsilon: float = 0.01,
     save_path: Optional[str] = None,
     artifacts_dir: Optional[str] = None,
     logs_dir: Optional[str] = None,
@@ -553,6 +742,15 @@ def train(
         smoothing=smoothing,
     )
     log.info(f"Using loss function: {loss_name}")
+    log.info(
+        "Multi-objective config | lambda_ssl=%.3f lambda_adv=%.3f temp=%.3f edge_drop=%.3f feature_mask=%.3f adv_eps=%.4f",
+        lambda_ssl,
+        lambda_adv,
+        ssl_temperature,
+        edge_drop_prob,
+        feature_mask_prob,
+        adv_epsilon,
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -581,6 +779,12 @@ def train(
             full_seq_index=full_seq_index,
             full_delta_t=full_delta_t,
             full_seq_mask=full_seq_mask,
+            lambda_ssl=lambda_ssl,
+            lambda_adv=lambda_adv,
+            ssl_temperature=ssl_temperature,
+            edge_drop_prob=edge_drop_prob,
+            feature_mask_prob=feature_mask_prob,
+            adv_epsilon=adv_epsilon,
         )
         val_metrics = evaluate(model, data, "val_mask", device, node_type)
 
@@ -672,6 +876,12 @@ def train(
             "max_v_features": max_v_features,
             "neighbor_hop1": neighbor_hop1,
             "neighbor_hop2": neighbor_hop2,
+            "lambda_ssl": lambda_ssl,
+            "lambda_adv": lambda_adv,
+            "ssl_temperature": ssl_temperature,
+            "edge_drop_prob": edge_drop_prob,
+            "feature_mask_prob": feature_mask_prob,
+            "adv_epsilon": adv_epsilon,
         },
         "decision_threshold": best_threshold,
         "calibration": calibration,
@@ -761,6 +971,12 @@ if __name__ == "__main__":
     parser.add_argument("--neighbor-hop2", type=int, default=8)
     parser.add_argument("--feature-mode", choices=["original", "enhanced"], default="enhanced")
     parser.add_argument("--pos-oversample-factor", type=int, default=1)
+    parser.add_argument("--lambda-ssl", type=float, default=0.1)
+    parser.add_argument("--lambda-adv", type=float, default=0.3)
+    parser.add_argument("--ssl-temperature", type=float, default=0.2)
+    parser.add_argument("--edge-drop-prob", type=float, default=0.1)
+    parser.add_argument("--feature-mask-prob", type=float, default=0.1)
+    parser.add_argument("--adv-epsilon", type=float, default=0.01)
     parser.add_argument("--save-path", default=None)
     parser.add_argument("--artifacts-dir", default='artifacts')
     parser.add_argument("--logs-dir", default=None)
@@ -786,6 +1002,12 @@ if __name__ == "__main__":
         neighbor_hop2=args.neighbor_hop2,
         feature_mode=args.feature_mode,
         pos_oversample_factor=args.pos_oversample_factor,
+        lambda_ssl=args.lambda_ssl,
+        lambda_adv=args.lambda_adv,
+        ssl_temperature=args.ssl_temperature,
+        edge_drop_prob=args.edge_drop_prob,
+        feature_mask_prob=args.feature_mask_prob,
+        adv_epsilon=args.adv_epsilon,
         save_path=args.save_path,
         artifacts_dir=args.artifacts_dir,
         logs_dir=args.logs_dir,

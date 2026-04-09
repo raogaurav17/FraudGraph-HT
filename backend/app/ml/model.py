@@ -88,7 +88,8 @@ class HTGNN(nn.Module):
 
         # 3. Temporal encoding
         self.time_enc = FourierTimeEncoding(hidden)
-        self.temporal_proj = nn.Linear(hidden, hidden)
+        txn_in_dim = in_channels.get("txn", hidden)
+        self.temporal_proj = nn.Linear(txn_in_dim, hidden)
 
         # 4. Temporal self-attention
         self.temporal_attn = nn.MultiheadAttention(
@@ -112,6 +113,14 @@ class HTGNN(nn.Module):
             nn.Linear(64, 1),
         )
 
+        # 6. Projection head for contrastive self-supervised learning
+        self.projector = nn.Sequential(
+            nn.Linear(hidden * 2, hidden * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout / 2),
+            nn.Linear(hidden * 2, hidden),
+        )
+
         self._init_weights()
 
     def _init_weights(self):
@@ -125,7 +134,7 @@ class HTGNN(nn.Module):
         self,
         x_dict: Dict[str, torch.Tensor],
         edge_index_dict: Dict,
-        txn_seq: Optional[torch.Tensor] = None,   # [B, seq_len, hidden]
+        txn_seq: Optional[torch.Tensor] = None,   # [B, seq_len, txn_feature_dim]
         delta_t: Optional[torch.Tensor] = None,   # [B, seq_len] time deltas
         seq_mask: Optional[torch.Tensor] = None,  # [B, seq_len] padding mask
         return_embeddings: bool = False,
@@ -185,6 +194,29 @@ class HTGNN(nn.Module):
         # -- 4. Classification --
         logits = self.head(fused).squeeze(-1)
         return logits
+
+    def encode(
+        self,
+        x_dict: Dict[str, torch.Tensor],
+        edge_index_dict: Dict,
+        txn_seq: Optional[torch.Tensor] = None,
+        delta_t: Optional[torch.Tensor] = None,
+        seq_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return fused transaction embeddings prior to classification."""
+        return self.forward(
+            x_dict=x_dict,
+            edge_index_dict=edge_index_dict,
+            txn_seq=txn_seq,
+            delta_t=delta_t,
+            seq_mask=seq_mask,
+            return_embeddings=True,
+        )
+
+    def project(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Project embeddings for contrastive training."""
+        z = self.projector(embeddings)
+        return F.normalize(z, p=2, dim=-1)
 
     def predict_proba(self, *args, **kwargs) -> torch.Tensor:
         logits = self.forward(*args, **kwargs)

@@ -133,37 +133,41 @@ def score_transaction(
     model: HTGNN = cache["model"]
     device = torch.device(settings.device)
 
-    # Build minimal HeteroData-like dicts for inference
-    # In production, this would pull graph context from the DB
-    txn_dim = cache["in_channels"].get("txn", 32)
-    card_dim = cache["in_channels"].get("card", 4)
-    merch_dim = cache["in_channels"].get("merchant", 3)
-
-    # Pad/truncate features to expected dimensions
-    txn_feat = _pad_features(txn_features, txn_dim)
-    card_feat = _pad_features(card_features or np.zeros(card_dim), card_dim)
-    merch_feat = _pad_features(merchant_features or np.zeros(merch_dim), merch_dim)
-
-    x_dict = {
-        "txn": torch.tensor(txn_feat, dtype=torch.float32).unsqueeze(0).to(device),
-        "card": torch.tensor(card_feat, dtype=torch.float32).unsqueeze(0).to(device),
-        "merchant": torch.tensor(merch_feat, dtype=torch.float32).unsqueeze(0).to(device),
+    feature_inputs = {
+        "txn": txn_features,
+        "card": card_features,
+        "merchant": merchant_features,
+        "device": device_features,
     }
+    x_dict, edge_index_dict = _build_inference_graph_inputs(cache, feature_inputs, device)
 
-    # Minimal edge index (self-loop for demo; real usage uses graph context)
-    edge_index_dict = {
-        ("card", "makes", "txn"): torch.tensor([[0], [0]], dtype=torch.long).to(device),
-        ("txn", "at", "merchant"): torch.tensor([[0], [0]], dtype=torch.long).to(device),
-    }
+    txn_seq_t = None
+    delta_t_t = None
+    seq_mask_t = None
+    txn_dim = cache["in_channels"].get("txn", len(np.asarray(txn_features).flatten()))
+    if card_sequence is not None and delta_t is not None:
+        seq_arr = np.asarray(card_sequence, dtype=np.float32)
+        dt_arr = np.asarray(delta_t, dtype=np.float32)
+        if seq_arr.ndim == 2 and dt_arr.ndim == 1 and seq_arr.shape[0] == dt_arr.shape[0]:
+            seq_arr = np.stack([_pad_features(row, txn_dim) for row in seq_arr], axis=0)
+            txn_seq_t = torch.tensor(seq_arr, dtype=torch.float32, device=device).unsqueeze(0)
+            delta_t_t = torch.tensor(dt_arr, dtype=torch.float32, device=device).unsqueeze(0)
+            seq_mask_t = torch.zeros((1, seq_arr.shape[0]), dtype=torch.bool, device=device)
 
     with torch.no_grad():
-        logits_tensor = model.forward(x_dict, edge_index_dict)
+        logits_tensor = model.forward(
+            x_dict,
+            edge_index_dict,
+            txn_seq=txn_seq_t,
+            delta_t=delta_t_t,
+            seq_mask=seq_mask_t,
+        )
         logits = float(logits_tensor.reshape(-1)[0].item())
         calibration = cache.get("calibration")
         if calibration:
-                prob = expit(calibration["scale"] * logits + calibration["bias"])
+            prob = expit(calibration["scale"] * logits + calibration["bias"])
         else:
-                prob = expit(logits)
+            prob = expit(logits)
 
     latency_ms = (time.perf_counter() - t0) * 1000
 
@@ -178,6 +182,58 @@ def score_transaction(
         "latency_ms": round(latency_ms, 2),
         "explanation": explanation,
     }
+
+
+def _build_inference_graph_inputs(
+    cache: Dict,
+    feature_inputs: Dict[str, Optional[np.ndarray]],
+    device: torch.device,
+) -> Tuple[Dict[str, torch.Tensor], Dict[Tuple[str, str, str], torch.Tensor]]:
+    """Build a minimal heterogeneous graph matching checkpoint metadata."""
+    metadata = cache.get("metadata")
+    in_channels = cache.get("in_channels", {})
+
+    node_types = []
+    edge_types = []
+    if isinstance(metadata, tuple) and len(metadata) == 2:
+        node_types, edge_types = metadata
+    elif isinstance(metadata, dict):
+        node_types = metadata.get("node_types", [])
+        edge_types = metadata.get("edge_types", [])
+
+    node_types = list(node_types) if node_types else list(in_channels.keys())
+    if "txn" not in node_types:
+        node_types = ["txn"] + [n for n in node_types if n != "txn"]
+
+    x_dict: Dict[str, torch.Tensor] = {}
+    for ntype in node_types:
+        dim = int(in_channels.get(ntype, in_channels.get("txn", 32)))
+        values = feature_inputs.get(ntype)
+        if values is None and ntype != "txn":
+            values = np.zeros(dim, dtype=np.float32)
+        if ntype == "txn" and values is None:
+            values = np.zeros(dim, dtype=np.float32)
+        feat = _pad_features(values, dim)
+        x_dict[ntype] = torch.tensor(feat, dtype=torch.float32, device=device).unsqueeze(0)
+
+    edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor] = {}
+    for rel in edge_types:
+        if not isinstance(rel, tuple) or len(rel) != 3:
+            continue
+        src, _, dst = rel
+        if src not in x_dict or dst not in x_dict:
+            continue
+        edge_index_dict[rel] = torch.tensor([[0], [0]], dtype=torch.long, device=device)
+
+    # Ensure at least one edge exists for common txn relations.
+    if not edge_index_dict:
+        for ntype in x_dict:
+            if ntype == "txn":
+                continue
+            edge_index_dict[(ntype, "rel", "txn")] = torch.tensor([[0], [0]], dtype=torch.long, device=device)
+            break
+
+    return x_dict, edge_index_dict
 
 
 def batch_score(transactions: List[Dict]) -> List[Dict]:
@@ -207,6 +263,8 @@ def get_model_info() -> Dict:
 
 
 def _pad_features(features: np.ndarray, target_dim: int) -> np.ndarray:
+    if features is None:
+        features = np.zeros(target_dim, dtype=np.float32)
     features = np.array(features, dtype=np.float32).flatten()
     if len(features) >= target_dim:
         return features[:target_dim]
