@@ -969,7 +969,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-cards-per-device", type=int, default=20)
     parser.add_argument("--neighbor-hop1", type=int, default=16)
     parser.add_argument("--neighbor-hop2", type=int, default=8)
-    parser.add_argument("--feature-mode", choices=["original", "enhanced"], default="enhanced")
+    parser.add_argument("--feature-mode", choices=["original", "enhanced", "raw"], default="enhanced")
     parser.add_argument("--pos-oversample-factor", type=int, default=1)
     parser.add_argument("--lambda-ssl", type=float, default=0.1)
     parser.add_argument("--lambda-adv", type=float, default=0.3)

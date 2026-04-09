@@ -5,7 +5,6 @@ from contextlib import asynccontextmanager
 import logging
 
 from app.core.config import get_settings
-from app.core.database import init_db
 from app.api.routes import router
 from app.ml.inference import load_model
 
@@ -17,7 +16,6 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     # Startup
     log.info("Initialising FraudGraph API...")
-    await init_db()
     load_model()  # warm up model
     log.info("Ready.")
     yield

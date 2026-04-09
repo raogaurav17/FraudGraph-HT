@@ -17,13 +17,6 @@ cd backend
 uv run uvicorn app.main:app --reload --port 8000
 ```
 
-### Run DB migrations
-
-```bash
-cd backend
-uv run alembic upgrade head
-```
-
 ### Train model
 
 ```bash

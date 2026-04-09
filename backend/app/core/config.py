@@ -13,17 +13,12 @@ DEFAULT_MODEL_PATH = str(PROJECT_ROOT / "models" / "htgnn_latest.pt")
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     # App
     app_name: str = "FraudGraph API"
     env: str = "development"
     debug: bool = True
-
-    # Database
-    database_url: str = "postgresql+asyncpg://fraud:fraud_secret@localhost:5432/fraudgraph"
-    db_pool_size: int = 10
-    db_max_overflow: int = 20
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"

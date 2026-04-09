@@ -4,7 +4,7 @@ Run: pytest tests/ -v
 """
 
 import numpy as np
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch
 from app.ml.inference import score_transaction, _get_risk_level, _pad_features
 from app.core.config import get_settings
 
@@ -58,7 +58,7 @@ def test_health_endpoint():
     from fastapi.testclient import TestClient
     from app.main import app
 
-    with patch("app.main.init_db", new=AsyncMock(return_value=None)), patch("app.main.load_model", return_value={}):
+    with patch("app.main.load_model", return_value={}):
         with TestClient(app) as client:
             response = client.get("/health")
             assert response.status_code == 200

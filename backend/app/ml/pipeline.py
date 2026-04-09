@@ -64,7 +64,7 @@ class IEEECISPipeline:
         self.max_v_features = max(0, min(max_v_features, len(self.V_COLS)))
         self.max_cards_per_device = max(2, max_cards_per_device)
         self.feature_mode = feature_mode
-        self.seq_len = 10 if feature_mode == "original" else 15
+        self.seq_len = 10 if feature_mode in ("original", "raw") else 15
 
     def load_raw(self) -> pd.DataFrame:
         tx_path = self.data_dir / "train_transaction.csv"
@@ -209,6 +209,46 @@ class IEEECISPipeline:
                 index=df.index,
             )
             df = pd.concat([df, derived], axis=1)
+            return df
+
+        if self.feature_mode == "raw":
+            t = pd.to_numeric(df["TransactionDT"], errors="coerce").fillna(0).to_numpy(dtype=np.float64)
+            q70 = np.quantile(t, 0.7)
+            q85 = np.quantile(t, 0.85)
+            df["split"] = np.where(t < q70, "train", np.where(t < q85, "val", "test"))
+
+            # Keep graph entity IDs from mostly raw identifiers.
+            df["card_id"] = df[self.CARD_COLS].fillna("NA").astype(str).agg("-".join, axis=1)
+            df["device_id"] = df["DeviceInfo"].fillna("unknown").astype(str)
+            df["addr_id"] = df["addr1"].fillna("NA").astype(str)
+
+            # Preserve categorical values as observed (minimal coercion).
+            for col in self.TXN_CAT_COLS + ["DeviceInfo", "ProductCD", "P_emaildomain", "R_emaildomain"]:
+                if col in df.columns:
+                    df[col] = df[col].fillna("UNKNOWN").astype(str)
+
+            # Minimal required numeric cleanup: train-median imputation only.
+            numeric_cols = [
+                "TransactionAmt",
+                "TransactionDT",
+                "dist1",
+                "dist2",
+                "card1",
+                "card2",
+                "card3",
+                "card5",
+                "addr1",
+            ] + [c for c in self.V_COLS[: self.max_v_features] if c in df.columns]
+
+            for col in numeric_cols:
+                s = pd.to_numeric(df[col], errors="coerce")
+                median_val = s[df["split"] == "train"].median()
+                if pd.isna(median_val):
+                    median_val = s.median()
+                if pd.isna(median_val):
+                    median_val = 0.0
+                df[col] = s.fillna(float(median_val))
+
             return df
 
         # Split is needed for leakage-safe imputations/statistics.
@@ -469,6 +509,18 @@ class IEEECISPipeline:
                 "amt_zscore_7d",
                 "is_new_device",
             ] + [c for c in self.V_COLS[: self.max_v_features] if c in df.columns]
+        elif self.feature_mode == "raw":
+            txn_feat_cols = [
+                "TransactionAmt",
+                "TransactionDT",
+                "dist1",
+                "dist2",
+                "card1",
+                "card2",
+                "card3",
+                "card5",
+                "addr1",
+            ] + [c for c in self.V_COLS[: self.max_v_features] if c in df.columns]
         else:
             txn_feat_cols = [
                 "log_amount",
@@ -513,20 +565,23 @@ class IEEECISPipeline:
             ] + [c for c in self.V_COLS[: self.max_v_features] if c in df.columns]
         txn_feats = df[txn_feat_cols].fillna(0).to_numpy(dtype=np.float32, copy=False)
 
-        # Train-only standardization keeps values in a stable numeric range.
-        train_rows = (df["split"].to_numpy() == "train")
-        if train_rows.any():
-            train_view = txn_feats[train_rows]
-            train_mean = np.nanmean(train_view, axis=0)
-            train_std = np.nanstd(train_view, axis=0)
-            train_mean = np.nan_to_num(train_mean, nan=0.0, posinf=0.0, neginf=0.0)
-            train_std = np.nan_to_num(train_std, nan=1.0, posinf=1.0, neginf=1.0)
-            train_std = np.where(train_std < 1e-3, 1.0, train_std)
-            txn_feats = (txn_feats - train_mean) / train_std
+        # Apply standardization only for engineered modes.
+        if self.feature_mode != "raw":
+            train_rows = (df["split"].to_numpy() == "train")
+            if train_rows.any():
+                train_view = txn_feats[train_rows]
+                train_mean = np.nanmean(train_view, axis=0)
+                train_std = np.nanstd(train_view, axis=0)
+                train_mean = np.nan_to_num(train_mean, nan=0.0, posinf=0.0, neginf=0.0)
+                train_std = np.nan_to_num(train_std, nan=1.0, posinf=1.0, neginf=1.0)
+                train_std = np.where(train_std < 1e-3, 1.0, train_std)
+                txn_feats = (txn_feats - train_mean) / train_std
 
-        # Final sanitization: remove non-finite values and clamp outliers.
+        # Final required sanitization only: keep finite float32 tensors.
         txn_feats = np.nan_to_num(txn_feats, nan=0.0, posinf=0.0, neginf=0.0)
-        txn_feats = np.clip(txn_feats, -10.0, 10.0).astype(np.float32, copy=False)
+        if self.feature_mode != "raw":
+            txn_feats = np.clip(txn_feats, -10.0, 10.0)
+        txn_feats = txn_feats.astype(np.float32, copy=False)
         data["txn"].x = torch.from_numpy(txn_feats)
 
         # Build compact per-transaction history indices to avoid dense [N, K, D] memory.
