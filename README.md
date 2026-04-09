@@ -1,95 +1,140 @@
-# FraudGraph — HTGNN Credit Card Fraud Detection Platform
+# FraudGraph - HTGNN Fraud Detection Platform
 
-A production-grade full-stack fraud detection system built on Heterogeneous Temporal Graph Neural Networks (HTGNN). Ingests multiple real-world datasets, trains a PyG-based GNN model, and exposes a real-time scoring API with a React dashboard.
+Production-oriented fraud detection platform with:
 
----
+- FastAPI backend for real-time scoring
+- React dashboard for monitoring and exploration
+- HTGNN training pipeline with configurable losses
+- Automated training artifacts (metrics + plots)
 
-## Architecture
+For full setup details, use [SETUP.md](SETUP.md).
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                     React Frontend                       │
-│   Dashboard · Transaction Explorer · Model Monitor      │
-└────────────────────┬────────────────────────────────────┘
-                     │  REST + WebSocket
-┌────────────────────▼────────────────────────────────────┐
-│                  FastAPI Backend                          │
-│   /api/predict  /api/transactions  /api/model/metrics   │
-└──────┬──────────────┬──────────────────┬────────────────┘
-       │              │                  │
-  PostgreSQL      Redis Cache       ML Service
-  (transactions)  (recent scores)   (HTGNN model)
-       │
-  DuckDB OLAP
-  (analytics queries)
-```
+## Tech Stack
 
-## Datasets Used
+- Frontend: React, Vite, Tailwind, Recharts, Zustand
+- Backend: FastAPI, SQLAlchemy, Alembic, Redis
+- ML: PyTorch, PyTorch Geometric, scikit-learn
+- Infra: Docker Compose, Nginx
+- Python package manager: uv
 
-| Dataset | Source | Size | Fraud Rate | Role |
-|---------|--------|------|------------|------|
-| IEEE-CIS | Kaggle / Vesta | 590K txns | 3.5% | Primary training |
-| YelpChi | DGL (CIKM 2020) | 45K nodes | 14.5% | GNN benchmark eval |
-| FraudAmazon | DGL (CIKM 2020) | 11K nodes | 9.5% | GNN benchmark eval |
-| PaySim | Kaggle | 6.3M txns | 0.13% | Scale + streaming sim |
-| Elliptic | Kaggle / MIT | 203K nodes | 16.4% | Temporal GNN eval |
-
-## Stack
-
-- **Frontend**: React 18, Vite, TailwindCSS, Recharts, React Query, Zustand
-- **Backend**: FastAPI, SQLAlchemy, Alembic, Pydantic v2, Redis
-- **ML**: PyTorch, PyTorch Geometric, scikit-learn, DGL
-- **Database**: PostgreSQL (operational), DuckDB (analytics)
-- **Infra**: Docker Compose, Nginx
-
----
-
-## Quick Start
+## Quick Start (uv + Docker)
 
 ```bash
-# 1. Clone and enter
-git clone <repo> && cd fraud-detection
+# 1) Clone
+git clone <repo-url> fraud-detection
+cd fraud-detection
 
-# 2. Download datasets (see data/README.md)
-python data/download.py
+# 2) Configure env
+cp backend/.env.example backend/.env
 
-# 3. Start all services
+# 3) Install deps
+cd backend && uv sync && cd ..
+cd frontend && npm install && cd ..
+
+# 4) Check dataset status
+uv run --project backend python data/download.py --status
+
+# 5) Start services
 docker compose up -d
 
-# 4. Run data pipeline
-docker compose exec backend python -m app.ml.pipeline
-
-# 5. Train model
-docker compose exec backend python -m app.ml.train
-
-# 6. Open dashboard
-open http://localhost:5173
+# 6) Run training (with artifacts)
+cd backend
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss weighted_bce --pos-weight 8.0
 ```
 
----
+Default app URLs:
 
-## Project Structure
+- Frontend: http://localhost:5173
+- Backend: http://localhost:8000
+- API Docs: http://localhost:8000/docs
 
+## Training Options
+
+Supported loss functions:
+
+- focal
+- bce
+- weighted_bce
+- dice
+
+Examples:
+
+```bash
+cd backend
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss focal
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss bce
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss weighted_bce --pos-weight 8.0
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss dice
 ```
+
+## Training Artifacts
+
+Artifacts are saved per run under:
+
+```text
+artifacts/training/<run_name>/
+```
+
+Includes:
+
+- training_validation_curves.png
+- precision_recall_curve.png
+- threshold_vs_precision_recall_f1.png
+- score_distribution_fraud_vs_nonfraud.png
+- roc_curve.png
+- calibration_curve_reliability_diagram.png
+- confusion_matrix.png
+- test_metrics_bar_chart.png
+- metrics_summary.json
+- threshold_scan_metrics.json
+
+Override artifacts location:
+
+```bash
+cd backend
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --artifacts-dir ../artifacts/custom
+```
+
+## Useful Make Targets
+
+```bash
+make up
+make logs
+make train
+make train-focal
+make train-bce
+make train-weighted-bce
+make train-dice
+make train-fast
+```
+
+Parameterized example:
+
+```bash
+make train DATASET=ieee_cis EPOCHS=5 TRAIN_LOSS=weighted_bce POS_WEIGHT=8.0 ARTIFACTS_DIR=artifacts
+```
+
+## API Endpoints
+
+- GET /health
+- POST /api/predict
+- POST /api/predict/batch
+- GET /api/transactions
+- GET /api/model/info
+- GET /api/stats/overview
+- GET /api/stats/timeseries
+- WS /api/ws/scores
+
+## Repository Layout
+
+```text
 fraud-detection/
-├── frontend/               # React app
-│   ├── src/
-│   │   ├── components/     # Reusable UI components
-│   │   ├── pages/          # Dashboard, Explorer, Monitor
-│   │   ├── hooks/          # useTransactions, useModel, useWebSocket
-│   │   ├── store/          # Zustand state management
-│   │   └── utils/          # API client, formatters
-│   └── package.json
-├── backend/
-│   ├── app/
-│   │   ├── api/            # FastAPI routers
-│   │   ├── core/           # Config, DB, Redis
-│   │   ├── models/         # SQLAlchemy models
-│   │   ├── services/       # Business logic
-│   │   └── ml/             # HTGNN model, pipeline, training
-│   ├── requirements.txt
-│   └── Dockerfile
-├── data/                   # Dataset download + preprocessing scripts
-├── docker/                 # Nginx config
-└── docker-compose.yml
+     backend/
+     frontend/
+     data/
+     docker/
+     artifacts/
+     docker-compose.yml
+     Makefile
+     SETUP.md
 ```

@@ -3,16 +3,12 @@ HTGNN — Heterogeneous Temporal Graph Neural Network
 Core model implementation using PyTorch Geometric.
 
 Architecture:
-  Input → Per-type Linear Projections → HANConv × 2 → Temporal Attention → MLP head
+    Input → Per-type Linear Projections → Temporal Self-Attention → MLP head
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch_geometric.nn import HANConv
-from torch_geometric.data import HeteroData
 from typing import Optional, Dict, Tuple
-import math
 
 
 class FourierTimeEncoding(nn.Module):
@@ -78,19 +74,11 @@ class HTGNN(nn.Module):
         # 1. Type-specific projections
         self.proj = TypeProjection(in_channels, hidden)
 
-        # 2. Heterogeneous attention convolutions
-        self.conv1 = HANConv(hidden, hidden, metadata, heads=heads, dropout=dropout)
-        self.conv2 = HANConv(hidden, hidden, metadata, heads=heads, dropout=dropout)
-
-        # Layer norms after each conv
-        self.norm1 = nn.LayerNorm(hidden)
-        self.norm2 = nn.LayerNorm(hidden)
-
-        # 3. Temporal encoding
+        # 2. Temporal encoding
         self.time_enc = FourierTimeEncoding(hidden)
         self.temporal_proj = nn.Linear(hidden, hidden)
 
-        # 4. Temporal self-attention
+        # 3. Temporal self-attention
         self.temporal_attn = nn.MultiheadAttention(
             hidden, num_heads=4, dropout=dropout, batch_first=True
         )
@@ -101,18 +89,33 @@ class HTGNN(nn.Module):
             nn.Sigmoid(),
         )
 
-        # 5. Fraud classification head
+        # 4. Fraud classification head
         self.head = nn.Sequential(
-            nn.Linear(hidden * 2, 256),
+            nn.Linear(hidden * 2, 64),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(dropout / 2),
             nn.Linear(64, 1),
         )
 
         self._init_weights()
+
+    def _aggregate_mean(
+        self,
+        source_embeddings: torch.Tensor,
+        edge_index: torch.Tensor,
+        num_dest_nodes: int,
+    ) -> torch.Tensor:
+        if edge_index is None or edge_index.numel() == 0:
+            return source_embeddings.new_zeros((num_dest_nodes, source_embeddings.size(-1)))
+
+        source_index = edge_index[0].long()
+        dest_index = edge_index[1].long()
+        aggregated = source_embeddings.new_zeros((num_dest_nodes, source_embeddings.size(-1)))
+        aggregated.index_add_(0, dest_index, source_embeddings[source_index])
+
+        counts = source_embeddings.new_zeros(num_dest_nodes)
+        counts.index_add_(0, dest_index, torch.ones_like(dest_index, dtype=source_embeddings.dtype))
+        return aggregated / counts.clamp_min(1.0).unsqueeze(-1)
 
     def _init_weights(self):
         for m in self.modules():
@@ -131,27 +134,47 @@ class HTGNN(nn.Module):
     ) -> torch.Tensor:
         # ── 1. Type projection ──
         h = self.proj(x_dict)
+        txn_emb = h["txn"]
 
-        # ── 2. Graph message passing ──
-        h1 = self.conv1(h, edge_index_dict)
-        h1 = {k: self.norm1(F.relu(v)) for k, v in h1.items()}
+        graph_contexts = []
+        card_txn_edge = edge_index_dict.get(("card", "makes", "txn"))
+        if card_txn_edge is not None and "card" in h:
+            graph_contexts.append(self._aggregate_mean(h["card"], card_txn_edge, txn_emb.size(0)))
 
-        h2 = self.conv2(h1, edge_index_dict)
-        h2 = {k: self.norm2(v) for k, v in h2.items()}
+        txn_merchant_edge = edge_index_dict.get(("txn", "at", "merchant"))
+        if txn_merchant_edge is not None and "merchant" in h:
+            graph_contexts.append(
+                self._aggregate_mean(h["merchant"], txn_merchant_edge.flip(0), txn_emb.size(0))
+            )
 
-        # Residual connection on txn node
-        txn_emb = h2["txn"] + h1.get("txn", torch.zeros_like(h2["txn"]))
+        txn_device_edge = edge_index_dict.get(("txn", "via", "device"))
+        if txn_device_edge is not None and "device" in h:
+            graph_contexts.append(
+                self._aggregate_mean(h["device"], txn_device_edge.flip(0), txn_emb.size(0))
+            )
 
-        # ── 3. Temporal attention ──
-        if txn_seq is not None and delta_t is not None:
-            t_enc = self.time_enc(delta_t)                # [B, seq, hidden]
-            seq = self.temporal_proj(txn_seq) + t_enc     # [B, seq, hidden]
+        if edge_index_dict.get(("card", "shared_device", "card")) is not None and "card" in h:
+            shared_card_context = self._aggregate_mean(
+                h["card"],
+                edge_index_dict[("card", "shared_device", "card")],
+                h["card"].size(0),
+            )
+            if card_txn_edge is not None:
+                graph_contexts.append(self._aggregate_mean(shared_card_context, card_txn_edge, txn_emb.size(0)))
 
-            query = txn_emb.unsqueeze(1)                  # [B, 1, hidden]
-            ctx, _ = self.temporal_attn(query, seq, seq)  # [B, 1, hidden]
-            ctx = ctx.squeeze(1)                          # [B, hidden]
+        if graph_contexts:
+            graph_ctx = torch.stack(graph_contexts, dim=0).mean(dim=0)
         else:
-            ctx = torch.zeros_like(txn_emb)
+            graph_ctx = torch.zeros_like(txn_emb)
+
+        # ── 2. Temporal attention ──
+        temporal_ctx = torch.zeros_like(txn_emb)
+        if txn_seq is not None and delta_t is not None:
+            seq = self.temporal_proj(txn_seq) + self.time_enc(delta_t)
+            seq, _ = self.temporal_attn(seq, seq, seq)
+            temporal_ctx = seq.mean(dim=1)
+
+        ctx = graph_ctx + temporal_ctx
 
         # Gate: how much temporal context to use
         g = self.gate(torch.cat([txn_emb, ctx], dim=-1))

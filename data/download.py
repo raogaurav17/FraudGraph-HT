@@ -3,7 +3,7 @@ Dataset download helper for FraudGraph.
 Downloads all supported datasets from public sources.
 
 Usage:
-    python data/download.py --datasets ieee_cis paysim elliptic yelp
+    uv run --project backend python data/download.py --datasets ieee_cis paysim elliptic
 """
 
 import os
@@ -53,30 +53,6 @@ DATASET_INFO = {
         3. Place in: data/elliptic/
         """,
     },
-    "yelp": {
-        "name": "YelpChi Fraud Dataset",
-        "url": "Via DGL (auto-downloaded)",
-        "dir": DATA_DIR / "yelp",
-        "files": [],
-        "instructions": """
-        Auto-downloaded by DGL when pipeline runs:
-            from dgl.data import FraudDataset
-            dataset = FraudDataset('yelp')  # downloads automatically
-        No manual action needed.
-        """,
-    },
-    "amazon": {
-        "name": "FraudAmazon Dataset",
-        "url": "Via DGL (auto-downloaded)",
-        "dir": DATA_DIR / "amazon",
-        "files": [],
-        "instructions": """
-        Auto-downloaded by DGL when pipeline runs:
-            from dgl.data import FraudDataset
-            dataset = FraudDataset('amazon')  # downloads automatically
-        No manual action needed.
-        """,
-    },
 }
 
 
@@ -114,7 +90,6 @@ def print_status():
                 print(f"    \033[91mmissing:{reset} {f}")
 
     print("\n" + "-" * 60)
-    print("Auto-downloadable: yelp, amazon (via DGL)")
     print("Manual download:   ieee_cis, paysim, elliptic (Kaggle)")
     print("-" * 60)
 

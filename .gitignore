@@ -1,3 +1,62 @@
-*.csv
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
 .venv/
+venv/
+env/
+backend/.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Node / frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.cache/
+
+# Build / runtime artifacts
+*.log
+*.pid
+*.out
+
+# ML artifacts and local outputs
+models/*.pt
+models/*.pth
+models/*.onnx
+backend/models/*.pt
+backend/models/*.pth
+backend/models/*.onnx
+artifacts/
+
+# Local data files
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+logs/

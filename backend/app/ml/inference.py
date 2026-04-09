@@ -9,6 +9,7 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
 import logging
+from scipy.special import expit
 
 from app.ml.model import HTGNN, build_model
 from app.core.config import get_settings
@@ -47,6 +48,8 @@ def load_model(model_path: str = None) -> Dict:
         "metadata": checkpoint.get("metadata"),
         "in_channels": checkpoint.get("in_channels"),
         "test_metrics": checkpoint.get("test_metrics", {}),
+        "decision_threshold": checkpoint.get("decision_threshold", settings.model_threshold),
+        "calibration": checkpoint.get("calibration"),
     }
     log.info(f"Loaded model v{_model_cache['version']}, test AUPRC={_model_cache['test_metrics'].get('auprc', 'N/A')}")
     return _model_cache
@@ -75,6 +78,8 @@ def _create_demo_model() -> Dict:
         "metadata": metadata,
         "in_channels": in_channels,
         "test_metrics": {"auprc": 0.0, "auroc": 0.0},
+        "decision_threshold": settings.model_threshold,
+        "calibration": None,
         "is_demo": True,
     }
 
@@ -128,7 +133,12 @@ def score_transaction(
     }
 
     with torch.no_grad():
-        prob = model.predict_proba(x_dict, edge_index_dict).item()
+        logits = model.forward(x_dict, edge_index_dict).item()
+        calibration = cache.get("calibration")
+        if calibration:
+                prob = expit(calibration["scale"] * logits + calibration["bias"])
+        else:
+                prob = expit(logits)
 
     latency_ms = (time.perf_counter() - t0) * 1000
 
@@ -139,6 +149,7 @@ def score_transaction(
         "fraud_probability": round(prob, 4),
         "risk_level": risk_level,
         "model_version": cache["version"],
+        "decision_threshold": cache.get("decision_threshold", settings.model_threshold),
         "latency_ms": round(latency_ms, 2),
         "explanation": explanation,
     }
@@ -164,6 +175,8 @@ def get_model_info() -> Dict:
         "version": cache["version"],
         "test_metrics": cache["test_metrics"],
         "in_channels": cache["in_channels"],
+        "decision_threshold": cache.get("decision_threshold", settings.model_threshold),
+        "calibration": cache.get("calibration"),
         "is_demo": cache.get("is_demo", False),
     }
 

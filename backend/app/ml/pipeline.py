@@ -17,6 +17,7 @@ from torch_geometric.data import HeteroData
 from typing import Dict, Tuple, Optional, List
 from pathlib import Path
 from dataclasses import dataclass
+from collections import defaultdict
 import logging
 
 log = logging.getLogger(__name__)
@@ -43,7 +44,10 @@ class IEEECISPipeline:
 
     CARD_COLS = ["card1", "card2", "card3", "card4", "card5", "card6", "addr1"]
     TXN_NUM_COLS = ["TransactionAmt", "dist1", "dist2"]
-    TXN_CAT_COLS = ["ProductCD", "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9"]
+    TXN_CAT_COLS = [
+        "ProductCD", "P_emaildomain", "R_emaildomain",
+        "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9",
+    ]
     V_COLS = [f"V{i}" for i in range(1, 100)]  # first 99 V-features
 
     def __init__(self, data_dir: str, max_rows: Optional[int] = None):
@@ -62,6 +66,9 @@ class IEEECISPipeline:
             "TransactionDT",
             "TransactionAmt",
             "isFraud",
+            "P_emaildomain",
+            "R_emaildomain",
+            *[col for col in self.TXN_NUM_COLS if col != "TransactionAmt"],
             *self.CARD_COLS,
             *self.TXN_CAT_COLS,
             *self.V_COLS,
@@ -82,29 +89,149 @@ class IEEECISPipeline:
 
         # Card proxy identity
         df["card_id"] = df[self.CARD_COLS].fillna("NA").astype(str).agg("-".join, axis=1)
+        df["email_id"] = (
+            df["P_emaildomain"].fillna("NA").astype(str)
+            + "|"
+            + df["R_emaildomain"].fillna("NA").astype(str)
+        )
+        df["device_id"] = df["DeviceInfo"].fillna("unknown").astype(str)
+        df["addr_id"] = df["addr1"].fillna("NA").astype(str)
 
-        # Log-scale amount
-        df["log_amount"] = np.log1p(df["TransactionAmt"])
+        # Keep chronological order for rolling feature construction.
+        df = df.sort_values(["card_id", "TransactionDT", "TransactionID"]).reset_index(drop=False)
+        df = df.rename(columns={"index": "_orig_index"})
 
-        # Hour of day (circular)
-        # TransactionDT is seconds elapsed from reference
-        df["hour"] = (df["TransactionDT"] // 3600) % 24
-        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
-        df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+        n_rows = len(df)
+        time_since_last = np.zeros(n_rows, dtype=np.float32)
+        txn_count_1d = np.zeros(n_rows, dtype=np.float32)
+        txn_count_7d = np.zeros(n_rows, dtype=np.float32)
+        txn_count_30d = np.zeros(n_rows, dtype=np.float32)
+        avg_amt_user = np.zeros(n_rows, dtype=np.float32)
+        std_amt_user = np.zeros(n_rows, dtype=np.float32)
+        unique_devices_per_user = np.zeros(n_rows, dtype=np.float32)
+        unique_emails_per_card = np.zeros(n_rows, dtype=np.float32)
+        card_device_count = np.zeros(n_rows, dtype=np.float32)
+        card_addr_count = np.zeros(n_rows, dtype=np.float32)
+        email_device_count = np.zeros(n_rows, dtype=np.float32)
 
-        # Rolling card-level aggregates (simplified — use last known)
-        df = df.sort_values("TransactionDT")
-        df["card_txn_seq"] = df.groupby("card_id").cumcount()
+        one_day = 86400.0
+        seven_days = 7.0 * one_day
+        thirty_days = 30.0 * one_day
+
+        for _, group in df.groupby("card_id", sort=False):
+            idx = group.index.to_numpy()
+            times = group["TransactionDT"].to_numpy(dtype=np.float64, copy=False)
+            amounts = group["TransactionAmt"].to_numpy(dtype=np.float32, copy=False)
+            devices = group["device_id"].astype(str).to_numpy()
+            emails = group["email_id"].astype(str).to_numpy()
+            addrs = group["addr_id"].astype(str).to_numpy()
+
+            n_group = len(group)
+            if n_group == 0:
+                continue
+
+            if n_group > 1:
+                time_since_last[idx[1:]] = np.diff(times).astype(np.float32, copy=False)
+
+            count_before = np.arange(n_group, dtype=np.float32)
+            prev_sum = np.cumsum(amounts, dtype=np.float64) - amounts
+            prev_sq = np.cumsum(amounts ** 2, dtype=np.float64) - amounts ** 2
+            avg_prev = np.zeros(n_group, dtype=np.float64)
+            np.divide(prev_sum, count_before, out=avg_prev, where=count_before > 0)
+            var_prev = np.zeros(n_group, dtype=np.float64)
+            np.divide(
+                prev_sq,
+                count_before,
+                out=var_prev,
+                where=count_before > 1,
+            )
+            var_prev = var_prev - np.square(avg_prev)
+            var_prev[count_before <= 1] = 0.0
+
+            starts_1d = np.searchsorted(times, times - one_day, side="left")
+            starts_7d = np.searchsorted(times, times - seven_days, side="left")
+            starts_30d = np.searchsorted(times, times - thirty_days, side="left")
+            positions = np.arange(n_group, dtype=np.float32)
+
+            txn_count_1d[idx] = positions - starts_1d.astype(np.float32)
+            txn_count_7d[idx] = positions - starts_7d.astype(np.float32)
+            txn_count_30d[idx] = positions - starts_30d.astype(np.float32)
+            avg_amt_user[idx] = avg_prev.astype(np.float32, copy=False)
+            std_amt_user[idx] = np.sqrt(np.clip(var_prev, 0.0, None)).astype(np.float32, copy=False)
+
+            seen_devices = set()
+            seen_emails = set()
+            seen_addrs = set()
+            device_counts = defaultdict(int)
+            addr_counts = defaultdict(int)
+            email_device_counts = defaultdict(int)
+
+            for pos, (device, email, addr) in enumerate(zip(devices, emails, addrs)):
+                seen_devices.add(device)
+                seen_emails.add(email)
+                seen_addrs.add(addr)
+
+                device_counts[device] += 1
+                addr_counts[addr] += 1
+                email_device_counts[(email, device)] += 1
+
+                unique_devices_per_user[idx[pos]] = float(len(seen_devices))
+                unique_emails_per_card[idx[pos]] = float(len(seen_emails))
+                card_device_count[idx[pos]] = float(device_counts[device])
+                card_addr_count[idx[pos]] = float(addr_counts[addr])
+                email_device_count[idx[pos]] = float(email_device_counts[(email, device)])
 
         # Fill missing V columns
         for col in self.V_COLS:
             if col in df.columns:
                 df[col] = df[col].fillna(df[col].median())
 
+        raw_numeric_cols = [
+            "TransactionAmt",
+            "dist1",
+            "dist2",
+            "card1",
+            "card2",
+            "card3",
+            "card5",
+            "addr1",
+        ]
+        for col in raw_numeric_cols:
+            if col in df.columns and not isinstance(df[col], pd.DataFrame):
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(df[col].median())
+
         # Fill categorical
         for col in self.TXN_CAT_COLS:
             if col in df.columns:
                 df[col] = df[col].fillna("UNKNOWN")
+
+        # Transaction-level engineered features for HTGNN input.
+        feature_df = pd.DataFrame(
+            {
+                "log_amount": np.log1p(df["TransactionAmt"]),
+                "hour": (df["TransactionDT"] // 3600) % 24,
+                "hour_sin": np.sin(2 * np.pi * ((df["TransactionDT"] // 3600) % 24) / 24),
+                "hour_cos": np.cos(2 * np.pi * ((df["TransactionDT"] // 3600) % 24) / 24),
+                "time_since_last_txn": time_since_last,
+                "txn_count_1d": txn_count_1d,
+                "txn_count_7d": txn_count_7d,
+                "txn_count_30d": txn_count_30d,
+                "avg_amt_user": avg_amt_user,
+                "std_amt_user": std_amt_user,
+                "unique_devices_per_user": unique_devices_per_user,
+                "unique_emails_per_card": unique_emails_per_card,
+                "card_device_count": card_device_count,
+                "card_addr_count": card_addr_count,
+                "email_device_count": email_device_count,
+                "card_txn_seq": df.groupby("card_id").cumcount().astype(np.float32),
+            },
+            index=df.index,
+        )
+
+        df = pd.concat([df, feature_df], axis=1)
+
+        # Return original order for downstream graph construction.
+        df = df.sort_values("_orig_index").drop(columns=["_orig_index"]).reset_index(drop=True)
 
         return df
 
@@ -122,7 +249,23 @@ class IEEECISPipeline:
         txn_ids = np.arange(len(df))
 
         # ── Transaction features ──
-        txn_feat_cols = ["log_amount", "hour_sin", "hour_cos"] + [
+        txn_feat_cols = [
+            "log_amount",
+            "hour_sin",
+            "hour_cos",
+            "time_since_last_txn",
+            "txn_count_1d",
+            "txn_count_7d",
+            "txn_count_30d",
+            "avg_amt_user",
+            "std_amt_user",
+            "unique_devices_per_user",
+            "unique_emails_per_card",
+            "card_device_count",
+            "card_addr_count",
+            "email_device_count",
+            "card_txn_seq",
+        ] + [
             c for c in self.V_COLS if c in df.columns
         ]
         txn_feats = df[txn_feat_cols].fillna(0).to_numpy(dtype=np.float32, copy=False)

@@ -22,9 +22,11 @@ from datetime import datetime
 import torch
 import numpy as np
 from torch_geometric.loader import NeighborLoader
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score, roc_auc_score,
 )
+from scipy.special import expit
 
 from app.ml.model import HTGNN, build_model
 from app.ml.losses import AVAILABLE_LOSSES, LossFn, build_loss_fn
@@ -93,9 +95,11 @@ def evaluate(
     mask_key: str,
     device: torch.device,
     node_type: str = "txn",
+    threshold: Optional[float] = None,
 ) -> Dict[str, float]:
     y_true, y_score = predict_scores(model, data, mask_key, device, node_type)
-    y_pred = (y_score >= settings.model_threshold).astype(int)
+    score_threshold = settings.model_threshold if threshold is None else threshold
+    y_pred = (y_score >= score_threshold).astype(int)
 
     metrics = {
         "auprc": float(average_precision_score(y_true, y_score)),
@@ -116,6 +120,17 @@ def predict_scores(
     device: torch.device,
     node_type: str = "txn",
 ) -> Tuple[np.ndarray, np.ndarray]:
+    y_true, logits = predict_logits(model, data, mask_key, device, node_type)
+    return y_true, expit(logits).astype(float)
+
+
+def predict_logits(
+    model: HTGNN,
+    data,
+    mask_key: str,
+    device: torch.device,
+    node_type: str = "txn",
+) -> Tuple[np.ndarray, np.ndarray]:
     model.eval()
     with torch.no_grad():
         # For simplicity: full-graph inference (use NeighborLoader in production)
@@ -125,8 +140,78 @@ def predict_scores(
         )
         mask = getattr(data[node_type], mask_key)
         y_true = data[node_type].y[mask].numpy()
-        y_score = torch.sigmoid(logits[mask]).cpu().numpy()
-    return y_true.astype(int), y_score.astype(float)
+        y_logits = logits[mask].detach().cpu().numpy()
+    return y_true.astype(int), y_logits.astype(float)
+
+
+def apply_platt_scaling(logits: np.ndarray, calibration: Optional[Dict[str, float]]) -> np.ndarray:
+    if not calibration:
+        return expit(logits)
+    scale = float(calibration.get("scale", 1.0))
+    bias = float(calibration.get("bias", 0.0))
+    return expit(scale * logits + bias)
+
+
+def compute_metrics_from_scores(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    threshold: float,
+) -> Dict[str, float]:
+    y_pred = (y_score >= threshold).astype(int)
+    precision = float((y_pred * y_true).sum() / (y_pred.sum() + 1e-8))
+    recall = float((y_pred * y_true).sum() / (y_true.sum() + 1e-8))
+    return {
+        "auprc": float(average_precision_score(y_true, y_score)),
+        "auroc": float(roc_auc_score(y_true, y_score)),
+        "precision": precision,
+        "recall": recall,
+        "f1": 2 * precision * recall / (precision + recall + 1e-8),
+    }
+
+
+def fit_platt_scaler(logits: np.ndarray, labels: np.ndarray) -> Optional[Dict[str, float]]:
+    labels = np.asarray(labels).astype(int)
+    if len(np.unique(labels)) < 2:
+        return None
+
+    clf = LogisticRegression(solver="lbfgs", max_iter=1000)
+    clf.fit(np.asarray(logits).reshape(-1, 1), labels)
+    return {
+        "method": "platt",
+        "scale": float(clf.coef_[0][0]),
+        "bias": float(clf.intercept_[0]),
+    }
+
+
+def sweep_thresholds(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    thresholds: np.ndarray,
+) -> Tuple[float, Dict[str, float], list]:
+    best_threshold = float(thresholds[0])
+    best_metrics = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    scan_rows = []
+
+    for threshold in thresholds:
+        y_pred = (y_score >= threshold).astype(int)
+        tp = float(((y_pred == 1) & (y_true == 1)).sum())
+        fp = float(((y_pred == 1) & (y_true == 0)).sum())
+        fn = float(((y_pred == 0) & (y_true == 1)).sum())
+        precision = tp / (tp + fp + 1e-8)
+        recall = tp / (tp + fn + 1e-8)
+        f1 = 2 * precision * recall / (precision + recall + 1e-8)
+        row = {
+            "threshold": float(threshold),
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+        }
+        scan_rows.append(row)
+        if f1 > best_metrics["f1"]:
+            best_threshold = float(threshold)
+            best_metrics = row
+
+    return best_threshold, best_metrics, scan_rows
 
 
 def train_epoch(
@@ -328,8 +413,28 @@ def train(
     # ── Test evaluation ──
     if best_state:
         model.load_state_dict(best_state)
-    test_y_true, test_y_score = predict_scores(model, data, "test_mask", device, node_type)
-    test_metrics = evaluate(model, data, "test_mask", device, node_type)
+
+    val_y_true, val_logits = predict_logits(model, data, "val_mask", device, node_type)
+    calibration = fit_platt_scaler(val_logits, val_y_true)
+    val_y_score = apply_platt_scaling(val_logits, calibration)
+
+    thresholds = np.linspace(0.05, 0.5, 50)
+    best_threshold, best_val_threshold_metrics, threshold_scan = sweep_thresholds(
+        val_y_true,
+        val_y_score,
+        thresholds,
+    )
+    log.info(
+        "Selected threshold %.3f on validation set | precision=%.4f | recall=%.4f | f1=%.4f",
+        best_threshold,
+        best_val_threshold_metrics["precision"],
+        best_val_threshold_metrics["recall"],
+        best_val_threshold_metrics["f1"],
+    )
+
+    test_y_true, test_logits = predict_logits(model, data, "test_mask", device, node_type)
+    test_y_score = apply_platt_scaling(test_logits, calibration)
+    test_metrics = compute_metrics_from_scores(test_y_true, test_y_score, best_threshold)
     log.info(f"Test metrics: {test_metrics}")
 
     # ── Save checkpoint ──
@@ -348,7 +453,11 @@ def train(
             "focal_gamma": focal_gamma,
             "pos_weight": effective_pos_weight,
         },
+        "decision_threshold": best_threshold,
+        "calibration": calibration,
         "train_metrics": history[-1] if history else {},
+        "val_threshold_metrics": best_val_threshold_metrics,
+        "threshold_scan": threshold_scan,
         "test_metrics": test_metrics,
         "dataset": primary_dataset,
         "n_params": n_params,
@@ -379,7 +488,7 @@ def train(
         test_y_true=test_y_true,
         test_y_score=test_y_score,
         test_metrics=test_metrics,
-        threshold=settings.model_threshold,
+        threshold=best_threshold,
         output_dir=run_artifacts_dir,
         run_summary={
             "version": version,
@@ -388,8 +497,11 @@ def train(
             "loss_name": loss_name,
             "model_path": str(save_path),
             "log_path": str(run_log_path),
+            "decision_threshold": best_threshold,
+            "calibration": calibration,
             "n_params": int(n_params),
         },
+        threshold_scan=threshold_scan,
     )
     log.info(f"Artifacts saved to {run_artifacts_dir}")
 
@@ -397,6 +509,8 @@ def train(
         "version": version,
         "test_auprc": test_metrics["auprc"],
         "test_auroc": test_metrics["auroc"],
+        "decision_threshold": best_threshold,
+        "calibration": calibration,
         "n_params": n_params,
         "history": history,
         "log_path": str(run_log_path),

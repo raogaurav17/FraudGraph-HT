@@ -1,171 +1,213 @@
-# FraudGraph — Setup Guide
+# FraudGraph Setup Guide (uv-first)
 
-Complete step-by-step setup for the HTGNN Credit Card Fraud Detection platform.
+This guide is aligned with the current repository state and uses `uv` for Python dependency management.
 
----
+## Documentation Index
+
+- Project overview and quick start: [README.md](README.md)
+- Backend-focused quick guide: [backend/README.md](backend/README.md)
+- Full setup and troubleshooting: [SETUP.md](SETUP.md)
 
 ## Prerequisites
 
-| Tool | Version | Purpose |
-|------|---------|---------|
-| Docker + Docker Compose | v24+ | All services |
-| Python | 3.11+ | ML pipeline, scripts |
-| Node.js | 20+ | Frontend dev |
-| 8 GB RAM | — | Model training |
-| GPU (optional) | CUDA 11.8+ | Faster training |
+| Tool | Recommended | Notes |
+|---|---|---|
+| Docker + Docker Compose | 24+ | For full stack (`postgres`, `redis`, `backend`, `frontend`, `nginx`) |
+| Python | 3.11+ | Backend runtime |
+| uv | latest | Dependency and virtualenv management |
+| Node.js | 20+ | Frontend local dev |
+| npm | 10+ | Frontend packages |
 
----
-
-## 1. Clone and configure
+## 1. Clone and Environment
 
 ```bash
 git clone <repo-url> fraud-detection
 cd fraud-detection
 
-# Copy environment template
 cp backend/.env.example backend/.env
-# Edit backend/.env — set POSTGRES password, Redis URL, etc.
 ```
 
-**`backend/.env` template:**
-```env
-DATABASE_URL=postgresql+asyncpg://fraud:fraud_secret@localhost:5432/fraudgraph
-REDIS_URL=redis://localhost:6379/0
-MODEL_PATH=models/htgnn_latest.pt
-DEVICE=cpu            # or cuda
-ENV=development
-```
+Important values in `backend/.env`:
 
----
+- `DATABASE_URL`
+- `REDIS_URL`
+- `MODEL_PATH`
+- `DEVICE`
+- `DATA_DIR`, `IEEE_CIS_PATH`, `PAYSIM_PATH`, `ELLIPTIC_PATH`
 
-## 2. Start infrastructure
+## 2. Install Dependencies
+
+### Backend (uv)
 
 ```bash
-# Start PostgreSQL + Redis only first
-docker compose up postgres redis -d
-
-# Wait for postgres to be ready
-docker compose logs postgres | grep "ready to accept connections"
-```
-
----
-
-## 3. Dataset download
-
-```bash
-# Check what's needed
-python data/download.py --status
-
-# Show download instructions per dataset
-python data/download.py --instructions ieee_cis paysim elliptic
-```
-
-### IEEE-CIS (primary, required)
-1. Go to https://www.kaggle.com/c/ieee-fraud-detection/data
-2. Accept competition rules
-3. Download `train_transaction.csv` + `train_identity.csv`
-4. Place in `data/ieee_cis/`
-
-### PaySim (synthetic, large scale)
-1. Go to https://www.kaggle.com/datasets/ealaxi/paysim1
-2. Download the CSV file
-3. Place in `data/paysim/`
-
-### Elliptic Bitcoin (temporal GNN benchmark)
-1. Go to https://www.kaggle.com/datasets/ellipticco/elliptic-data-set
-2. Download all three CSVs
-3. Place in `data/elliptic/`
-
-### YelpChi + FraudAmazon (auto-downloaded via DGL)
-```bash
-# These download automatically when the pipeline runs
-pip install dgl
-python -c "from dgl.data import FraudDataset; FraudDataset('yelp'); FraudDataset('amazon')"
-```
-
----
-
-## 4. Run the ML pipeline
-
-```bash
-# Install Python deps
-pip install -r backend/requirements.txt
-
-# Install PyG extras (CPU)
-pip install torch-scatter torch-sparse \
-  -f https://data.pyg.org/whl/torch-2.3.0+cpu.html
-
-# Run full data pipeline (IEEE-CIS + PaySim + Elliptic + YelpChi)
 cd backend
-python -m app.ml.pipeline
-
-# Or train directly (auto-runs pipeline if model missing)
-python -m app.ml.train --dataset ieee_cis --epochs 50
-
-# For GPU training
-python -m app.ml.train --dataset ieee_cis --epochs 100 --hidden 256 --heads 8
+uv sync
+cd ..
 ```
 
-Training output example:
-```
-Epoch 001/050 | loss=0.4821 | val_auprc=0.4231 | val_auroc=0.7812 | time=28.3s
-Epoch 010/050 | loss=0.2341 | val_auprc=0.7123 | val_auroc=0.8934 | time=24.1s
-Epoch 030/050 | loss=0.1124 | val_auprc=0.8756 | val_auroc=0.9312 | time=22.8s
-...
-Test metrics: {'auprc': 0.891, 'auroc': 0.938, 'f1': 0.742}
-Model saved to models/htgnn_latest.pt
-```
+Notes:
 
----
+- Dependencies are maintained through `uv` (`backend/pyproject.toml` + `backend/uv.lock`).
+- If you add packages, use `uv add ...` in `backend/`.
 
-## 5. Start all services
+### Frontend
 
 ```bash
-# Start everything
+cd frontend
+npm install
+cd ..
+```
+
+## 3. Dataset Preparation
+
+Check what is present:
+
+```bash
+uv run --project backend python data/download.py --status
+```
+
+Print dataset-specific instructions:
+
+```bash
+uv run --project backend python data/download.py --instructions ieee_cis paysim elliptic
+```
+
+Expected locations:
+
+- `data/ieee_cis/`
+- `data/paysim/`
+- `data/elliptic/`
+
+## 4. Start Services
+
+### Option A: Docker (recommended full stack)
+
+```bash
 docker compose up -d
-
-# Check all services are healthy
 docker compose ps
-
-# View logs
-docker compose logs -f backend
-docker compose logs -f frontend
 ```
 
-Services:
-- **Frontend**: http://localhost:5173 (dev) or http://localhost (via nginx)
-- **Backend API**: http://localhost:8000
-- **API Docs**: http://localhost:8000/docs
-- **PostgreSQL**: localhost:5432
-- **Redis**: localhost:6379
+URLs:
 
----
+- Frontend: `http://localhost:5173`
+- Backend API: `http://localhost:8000`
+- Swagger: `http://localhost:8000/docs`
+- Nginx: `http://localhost`
 
-## 6. Populate demo data
+### Option B: Local dev commands
+
+Terminal 1:
 
 ```bash
-# Install simulation deps
-pip install httpx
-
-# Run 500 simulated transactions (fast batch)
-python scripts/simulate.py --count 500 --dataset mixed
-
-# Stream live transactions to demo the real-time dashboard
-python scripts/simulate.py --stream --interval 0.5
-
-# Only IEEE-CIS-style transactions
-python scripts/simulate.py --count 200 --dataset ieee_cis
+cd backend
+uv run uvicorn app.main:app --reload --port 8000
 ```
 
----
-
-## 7. Verify everything works
+Terminal 2:
 
 ```bash
-# Health check
+cd frontend
+npm run dev
+```
+
+## 5. Database Migration
+
+If needed for local DB state:
+
+```bash
+cd backend
+uv run alembic upgrade head
+```
+
+Or from root:
+
+```bash
+make db-migrate
+```
+
+## 6. ML Pipeline and Training
+
+### Run preprocessing pipeline
+
+```bash
+cd backend
+uv run python -m app.ml.pipeline
+```
+
+### Train model
+
+```bash
+cd backend
+uv run python -m app.ml.train --dataset ieee_cis --epochs 50
+```
+
+### Train with selectable loss functions
+
+```bash
+cd backend
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss focal
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss bce
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss weighted_bce --pos-weight 8.0
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --loss dice
+```
+
+### Artifacts output
+
+- By default, training stores plots/metrics under `artifacts/training/<run_name>/`.
+- Override path:
+
+```bash
+cd backend
+uv run python -m app.ml.train --dataset ieee_cis --epochs 5 --artifacts-dir ../artifacts/custom
+```
+
+Generated artifacts include:
+
+- Training/validation curves
+- Precision-Recall curve
+- Threshold vs Precision/Recall/F1
+- Score distribution (fraud vs non-fraud)
+- ROC curve
+- Calibration curve
+- Confusion matrix
+- Test metric bar chart
+- `metrics_summary.json`
+- `threshold_scan_metrics.json`
+
+## 7. Makefile Shortcuts
+
+Common targets from project root:
+
+```bash
+make up
+make down
+make logs
+make pipeline
+make train
+make train-focal
+make train-bce
+make train-weighted-bce
+make train-dice
+make train-fast
+```
+
+Examples with overrides:
+
+```bash
+make train DATASET=ieee_cis EPOCHS=5 TRAIN_LOSS=weighted_bce POS_WEIGHT=8.0 ARTIFACTS_DIR=artifacts
+```
+
+## 8. API Sanity Checks
+
+Health endpoint:
+
+```bash
 curl http://localhost:8000/health
+```
 
-# Score a test transaction
+Single prediction:
+
+```bash
 curl -X POST http://localhost:8000/api/predict \
   -H "Content-Type: application/json" \
   -d '{
@@ -177,159 +219,32 @@ curl -X POST http://localhost:8000/api/predict \
     "country_mismatch": true,
     "merchant_fraud_rate": 0.18
   }'
-
-# Expected response
-{
-  "transaction_id": "...",
-  "fraud_probability": 0.8742,
-  "risk_level": "CRITICAL",
-  "model_version": "...",
-  "latency_ms": 12.3,
-  "explanation": {...}
-}
 ```
 
----
+Useful API routes:
 
-## Architecture details
+- `POST /api/predict`
+- `POST /api/predict/batch`
+- `GET /api/transactions`
+- `GET /api/model/info`
+- `GET /api/stats/overview`
+- `GET /api/stats/timeseries`
+- `WS /api/ws/scores`
 
-### Backend (`backend/app/`)
+## 9. Troubleshooting
 
-```
-app/
-├── main.py           # FastAPI app + lifespan
-├── api/
-│   └── routes.py     # All API endpoints + WebSocket
-├── core/
-│   ├── config.py     # Pydantic settings
-│   ├── database.py   # Async SQLAlchemy + session
-│   └── redis.py      # Redis cache + pubsub
-├── models/
-│   └── db.py         # SQLAlchemy ORM models
-└── ml/
-    ├── model.py       # HTGNN architecture (PyTorch Geometric)
-    ├── pipeline.py    # Multi-dataset loaders (IEEE-CIS, PaySim, Elliptic, YelpChi)
-    ├── train.py       # Training loop with focal loss + early stopping
-    └── inference.py   # Real-time scoring service
-```
+`ModuleNotFoundError` when running backend commands:
 
-### Frontend (`frontend/src/`)
+- Run via `uv run ...` from `backend/`, or ensure `backend/.venv` is active.
 
-```
-src/
-├── App.tsx            # Router + WebSocket connection + nav
-├── pages/
-│   ├── Dashboard.tsx  # Overview stats, charts, live feed
-│   ├── Predict.tsx    # Transaction scoring UI with explanations
-│   ├── Explorer.tsx   # Paginated transaction browser with filters
-│   └── Monitor.tsx    # Model architecture, training curves, per-dataset metrics
-├── components/
-│   └── ui.tsx         # RiskBadge, ProbBar, StatTile, Charts, etc.
-├── store/index.ts     # Zustand global state (live scores, WS status)
-└── utils/api.ts       # Axios client + TypeScript types + WebSocket factory
-```
+IEEE-CIS missing files:
 
-### ML pipeline
+- Ensure `train_transaction.csv` and `train_identity.csv` are in `data/ieee_cis/`.
 
-```
-IEEE-CIS CSV  →  IEEECISPipeline.engineer_features()
-                     ↓
-              build_hetero_data()   →  HeteroData(
-                                         txn, card, merchant, device
-                                         card→txn, txn→merchant, txn→device,
-                                         card→card (shared device)
-                                       )
-                     ↓
-PaySim CSV    →  PaySimPipeline     →  HeteroData(account, txn)
-                     ↓
-Elliptic CSVs →  EllipticPipeline   →  HeteroData(txn)  [homogeneous]
-                     ↓
-YelpChi/Amazon → load_dgl_fraud_dataset() → HeteroData(review/user, 3 relations)
-                     ↓
-              HTGNN.forward()
-                     ↓
-              focal_loss()  →  AdamW  →  checkpoint
-```
+Training is slow at startup:
 
----
+- Initial CSV loading/preprocessing can take time on first run.
 
-## API reference
+No file logs for training:
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/predict` | POST | Score single transaction |
-| `/api/predict/batch` | POST | Score up to 100 transactions |
-| `/api/transactions` | GET | List transactions (paginated) |
-| `/api/transactions/{id}` | GET | Get single transaction + prediction |
-| `/api/stats/overview` | GET | Dashboard summary stats |
-| `/api/stats/timeseries` | GET | Hourly transaction/fraud counts |
-| `/api/model/info` | GET | Current model version + metrics |
-| `/api/ws/scores` | WS | Real-time fraud score stream |
-| `/docs` | GET | Interactive Swagger UI |
-
----
-
-## Training tips
-
-### On 6GB RAM (your Lenovo IdeaPad)
-
-```bash
-# Use smaller batch size, fewer neighbours
-python -m app.ml.train \
-  --dataset ieee_cis \
-  --epochs 30 \
-  --hidden 64 \
-  --heads 2 \
-  --batch-size 256
-```
-
-This keeps peak RAM under 4GB. With your 2GB zram + 4GB swapfile you can push to hidden=128.
-
-### GPU training (if available)
-
-```bash
-# Update backend/.env
-DEVICE=cuda
-
-# Use GPU PyG wheels
-pip install torch-scatter torch-sparse \
-  -f https://data.pyg.org/whl/torch-2.3.0+cu118.html
-
-python -m app.ml.train \
-  --dataset ieee_cis \
-  --epochs 100 \
-  --hidden 256 \
-  --heads 8 \
-  --batch-size 1024
-```
-
-### Multi-dataset training (advanced)
-
-```bash
-# Train on IEEE-CIS first, then fine-tune on YelpChi
-python -m app.ml.train --dataset ieee_cis --epochs 50
-python -m app.ml.train --dataset yelp    --epochs 20 \
-  --pretrained models/htgnn_latest.pt
-```
-
----
-
-## Common issues
-
-**`FileNotFoundError: IEEE-CIS data not found`**
-→ Place `train_transaction.csv` in `data/ieee_cis/`. See step 3.
-
-**`OOM during training`**
-→ Reduce `--batch-size` to 128 and `--hidden` to 64.
-
-**`torch_scatter not found`**
-→ Install with exact PyTorch version: `pip install torch-scatter -f https://data.pyg.org/whl/torch-2.3.0+cpu.html`
-
-**Frontend shows empty dashboard**
-→ Run `python scripts/simulate.py --count 200` to seed demo data.
-
-**WebSocket not connecting**
-→ Ensure Redis is running: `docker compose up redis -d`
-
-**Model shows "demo_v0"**
-→ No trained model found. Either run the training pipeline or use demo mode (scores are random but UI is fully functional).
+- Current training logs are printed to console; metrics/plots are saved in `artifacts/...`.

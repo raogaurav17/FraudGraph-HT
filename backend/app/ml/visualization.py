@@ -254,6 +254,7 @@ def create_training_artifacts(
     threshold: float,
     output_dir: Path,
     run_summary: Dict,
+    threshold_scan: List[Dict] | None = None,
 ) -> Dict[str, str]:
     """Generate and save plots/metrics artifacts for one training run."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -267,11 +268,12 @@ def create_training_artifacts(
     _plot_confusion_matrix(test_y_true, test_y_score, threshold, output_dir)
     _plot_test_metric_bars(test_metrics, output_dir)
 
-    threshold_scan = []
-    for threshold_value in np.linspace(0.01, 0.99, 99):
-        threshold_scan.append(
-            _binary_metrics_at_threshold(test_y_true, test_y_score, float(threshold_value))
-        )
+    if threshold_scan is None:
+        threshold_scan = []
+        for threshold_value in np.linspace(0.05, 0.5, 50):
+            threshold_scan.append(
+                _binary_metrics_at_threshold(test_y_true, test_y_score, float(threshold_value))
+            )
 
     summary = {
         **run_summary,
@@ -284,10 +286,7 @@ def create_training_artifacts(
     }
 
     (output_dir / "metrics_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    (output_dir / "threshold_scan_metrics.json").write_text(
-        json.dumps(threshold_scan, indent=2),
-        encoding="utf-8",
-    )
+    (output_dir / "threshold_scan_metrics.json").write_text(json.dumps(threshold_scan, indent=2), encoding="utf-8")
 
     return {
         "artifacts_dir": str(output_dir),
