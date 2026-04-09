@@ -304,10 +304,17 @@ def train_epoch(
         labels = batch[node_type].y[:n_seed].float()
 
         if not torch.isfinite(logits).all():
-            skipped_batches += 1
-            log.warning("Skipping batch with non-finite logits")
-            del batch, txn_seq, delta_t, seq_mask, logits, labels
-            continue
+            finite_rows = torch.isfinite(logits)
+            if not finite_rows.any():
+                skipped_batches += 1
+                log.warning("Skipping batch with all non-finite logits")
+                del batch, txn_seq, delta_t, seq_mask, logits, labels
+                continue
+
+            bad_count = int((~finite_rows).sum().item())
+            log.warning("Dropping %d non-finite logits from batch", bad_count)
+            logits = logits[finite_rows]
+            labels = labels[finite_rows]
 
         loss = loss_fn(logits, labels)
 

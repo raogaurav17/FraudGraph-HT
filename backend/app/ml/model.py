@@ -1,11 +1,18 @@
 """
-HTGNN — heterogeneous temporal graph model optimized for lower memory footprint.
+HTGNN — Heterogeneous Temporal Graph Neural Network
+Core model implementation using PyTorch Geometric.
+
+Architecture:
+  Input -> Per-type Linear Projections -> HANConv x 2 -> Temporal Attention -> MLP head
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch_geometric.nn import HANConv
+from torch_geometric.data import HeteroData
 from typing import Optional, Dict, Tuple
+import math
 
 
 class FourierTimeEncoding(nn.Module):
@@ -17,7 +24,7 @@ class FourierTimeEncoding(nn.Module):
         self.w = nn.Linear(1, d_model // 2)
 
     def forward(self, delta_t: torch.Tensor) -> torch.Tensor:
-        # delta_t: [...] → [..., d_model]
+        # delta_t: [...] -> [..., d_model]
         t = delta_t.unsqueeze(-1).float()
         freqs = self.w(t)
         return torch.cat([torch.sin(freqs), torch.cos(freqs)], dim=-1)
@@ -31,8 +38,8 @@ class TypeProjection(nn.Module):
         self.layers = nn.ModuleDict({
             ntype: nn.Sequential(
                 nn.Linear(in_ch, hidden),
-                nn.LayerNorm(hidden),
-                nn.GELU(),
+                nn.BatchNorm1d(hidden),
+                nn.ReLU(),
                 nn.Dropout(0.1),
             )
             for ntype, in_ch in in_channels.items()
@@ -67,93 +74,45 @@ class HTGNN(nn.Module):
         super().__init__()
         self.hidden = hidden
         self.seq_len = seq_len
-        self.metadata = metadata
 
-        txn_in_dim = int(in_channels.get("txn", hidden))
+        # 1. Type-specific projections
         self.proj = TypeProjection(in_channels, hidden)
 
-        self.use_han = False
-        self.han1 = None
-        self.han2 = None
-        try:
-            from torch_geometric.nn import HANConv
+        # 2. Heterogeneous attention convolutions
+        self.conv1 = HANConv(hidden, hidden, metadata, heads=heads, dropout=dropout)
+        self.conv2 = HANConv(hidden, hidden, metadata, heads=heads, dropout=dropout)
 
-            self.han1 = HANConv(hidden, hidden, metadata, heads=max(1, heads), dropout=dropout)
-            self.han2 = HANConv(hidden, hidden, metadata, heads=max(1, heads), dropout=dropout)
-            self.use_han = True
-        except Exception:
-            self.use_han = False
+        # Layer norms after each conv
+        self.norm1 = nn.LayerNorm(hidden)
+        self.norm2 = nn.LayerNorm(hidden)
 
-        self.graph_norm1 = nn.LayerNorm(hidden)
-        self.graph_norm2 = nn.LayerNorm(hidden)
-
-        self.seq_input = nn.Linear(txn_in_dim, hidden)
+        # 3. Temporal encoding
         self.time_enc = FourierTimeEncoding(hidden)
         self.temporal_proj = nn.Linear(hidden, hidden)
+
+        # 4. Temporal self-attention
         self.temporal_attn = nn.MultiheadAttention(
-            hidden,
-            num_heads=max(1, heads),
-            dropout=dropout,
-            batch_first=True,
+            hidden, num_heads=4, dropout=dropout, batch_first=True
         )
 
+        # Gating: combine graph embedding with temporal context
         self.gate = nn.Sequential(
             nn.Linear(hidden * 2, hidden),
             nn.Sigmoid(),
         )
 
+        # 5. Fraud classification head
         self.head = nn.Sequential(
-            nn.Linear(hidden * 2, hidden),
+            nn.Linear(hidden * 2, 256),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, 64),
+            nn.Linear(256, 64),
             nn.ReLU(),
             nn.Dropout(dropout / 2),
             nn.Linear(64, 1),
         )
 
         self._init_weights()
-
-    def _encode_graph(
-        self,
-        x_dict: Dict[str, torch.Tensor],
-        edge_index_dict: Dict,
-    ) -> Dict[str, torch.Tensor]:
-        proj = self.proj(x_dict)
-
-        if not self.use_han or self.han1 is None or self.han2 is None:
-            return proj
-
-        edge_subset = {}
-        for edge_type, edge_index in edge_index_dict.items():
-            src_type, _, dst_type = edge_type
-            if src_type in proj and dst_type in proj:
-                edge_subset[edge_type] = edge_index
-
-        if not edge_subset:
-            return proj
-
-        try:
-            h = self.han1(proj, edge_subset)
-            h = {
-                k: F.relu(self.graph_norm1(v))
-                for k, v in h.items()
-                if v is not None
-            }
-            if not h:
-                return proj
-
-            h = self.han2(h, edge_subset)
-            h = {
-                k: self.graph_norm2(v)
-                for k, v in h.items()
-                if v is not None
-            }
-            return h or proj
-        except Exception:
-            # If heterogeneous attention fails for sparse/incomplete toy inputs,
-            # keep inference alive by using projected node features.
-            return proj
 
     def _init_weights(self):
         for m in self.modules():
@@ -166,31 +125,34 @@ class HTGNN(nn.Module):
         self,
         x_dict: Dict[str, torch.Tensor],
         edge_index_dict: Dict,
-        txn_seq: Optional[torch.Tensor] = None,   # [N, seq_len, input_dim]
-        delta_t: Optional[torch.Tensor] = None,   # [N, seq_len] time deltas
-        seq_mask: Optional[torch.Tensor] = None,  # [N, seq_len] true for padding
+        txn_seq: Optional[torch.Tensor] = None,   # [B, seq_len, hidden]
+        delta_t: Optional[torch.Tensor] = None,   # [B, seq_len] time deltas
+        seq_mask: Optional[torch.Tensor] = None,  # [B, seq_len] padding mask
         return_embeddings: bool = False,
     ) -> torch.Tensor:
-        txn_x = x_dict.get("txn")
-        if txn_x is None:
-            raise ValueError("x_dict must contain 'txn' node features")
+        # -- 1. Type projection --
+        h = self.proj(x_dict)
 
-        graph_dict = self._encode_graph(x_dict, edge_index_dict)
-        h1_txn = graph_dict.get("txn")
-        if h1_txn is None:
-            # No graph context available, fall back to projected txn input.
-            h1_txn = self.proj({"txn": txn_x}).get("txn")
+        # -- 2. Graph message passing --
+        h1 = self.conv1(h, edge_index_dict)
+        h1 = {k: self.norm1(F.relu(v)) for k, v in h1.items()}
 
-        txn_emb = h1_txn
+        h2 = self.conv2(h1, edge_index_dict)
+        h2 = {k: self.norm2(v) for k, v in h2.items()}
 
-        if txn_seq is not None and delta_t is not None and txn_seq.ndim == 3:
-            seq = self.seq_input(txn_seq.float()) + self.time_enc(delta_t.float())
-            seq = self.temporal_proj(seq)
+        # Residual connection on txn node
+        txn_emb = h2["txn"] + h1.get("txn", torch.zeros_like(h2["txn"]))
 
+        # -- 3. Temporal attention --
+        if txn_seq is not None and delta_t is not None:
+            t_enc = self.time_enc(delta_t)                # [B, seq, hidden]
+            seq = self.temporal_proj(txn_seq) + t_enc     # [B, seq, hidden]
+
+            query = txn_emb.unsqueeze(1)                  # [B, 1, hidden]
             key_padding_mask = seq_mask.bool() if seq_mask is not None else None
             valid_hist = None
             if key_padding_mask is not None:
-                # If a row has all positions masked, attention softmax can produce NaN.
+                # All-masked rows can make attention softmax produce NaNs.
                 valid_hist = (~key_padding_mask).any(dim=1)
                 if not bool(valid_hist.all()):
                     key_padding_mask = key_padding_mask.clone()
@@ -199,9 +161,13 @@ class HTGNN(nn.Module):
                     key_padding_mask[invalid_rows, 0] = False
                     seq[invalid_rows, 0, :] = 0.0
 
-            query = txn_emb.unsqueeze(1)
-            ctx, _ = self.temporal_attn(query, seq, seq, key_padding_mask=key_padding_mask)
-            ctx = ctx.squeeze(1)
+            ctx, _ = self.temporal_attn(
+                query,
+                seq,
+                seq,
+                key_padding_mask=key_padding_mask,
+            )
+            ctx = ctx.squeeze(1)                          # [B, hidden]
 
             if valid_hist is not None and not bool(valid_hist.all()):
                 ctx = ctx.clone()
@@ -209,12 +175,14 @@ class HTGNN(nn.Module):
         else:
             ctx = torch.zeros_like(txn_emb)
 
-        gate = self.gate(torch.cat([txn_emb, ctx], dim=-1))
-        fused = torch.cat([txn_emb, gate * ctx], dim=-1)
+        # Gate: how much temporal context to use
+        g = self.gate(torch.cat([txn_emb, ctx], dim=-1))
+        fused = torch.cat([txn_emb, g * ctx], dim=-1)    # [B, hidden*2]
 
         if return_embeddings:
             return fused
 
+        # -- 4. Classification --
         logits = self.head(fused).squeeze(-1)
         return logits
 

@@ -14,10 +14,9 @@ For full setup details, use [SETUP.md](SETUP.md).
 - Frontend: React, Vite, Tailwind, Recharts, Zustand
 - Backend: FastAPI, SQLAlchemy, Alembic, Redis
 - ML: PyTorch, PyTorch Geometric, scikit-learn
-- Infra: Docker Compose, Nginx
 - Python package manager: uv
 
-## Quick Start (uv + Docker)
+## Quick Start (uv)
 
 ```bash
 # 1) Clone
@@ -35,7 +34,8 @@ cd frontend && npm install && cd ..
 uv run --project backend python data/download.py --status
 
 # 5) Start services
-docker compose up -d
+cd backend && uv run uvicorn app.main:app --reload --port 8000
+cd frontend && npm run dev
 
 # 6) Run training (with artifacts)
 cd backend
@@ -132,9 +132,7 @@ fraud-detection/
      backend/
      frontend/
      data/
-     docker/
      artifacts/
-     docker-compose.yml
      Makefile
      SETUP.md
 ```

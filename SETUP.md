@@ -12,7 +12,6 @@ This guide is aligned with the current repository state and uses `uv` for Python
 
 | Tool | Recommended | Notes |
 |---|---|---|
-| Docker + Docker Compose | 24+ | For full stack (`postgres`, `redis`, `backend`, `frontend`, `nginx`) |
 | Python | 3.11+ | Backend runtime |
 | uv | latest | Dependency and virtualenv management |
 | Node.js | 20+ | Frontend local dev |
@@ -80,21 +79,7 @@ Expected locations:
 
 ## 4. Start Services
 
-### Option A: Docker (recommended full stack)
-
-```bash
-docker compose up -d
-docker compose ps
-```
-
-URLs:
-
-- Frontend: `http://localhost:5173`
-- Backend API: `http://localhost:8000`
-- Swagger: `http://localhost:8000/docs`
-- Nginx: `http://localhost`
-
-### Option B: Local dev commands
+Run services locally in separate terminals:
 
 Terminal 1:
 

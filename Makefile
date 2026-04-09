@@ -15,26 +15,24 @@ LOGS_DIR ?=
 
 # ── Infrastructure ────────────────────────────────────────────────
 up:
-	docker compose up -d
-	@echo "Services started. Dashboard: http://localhost:5173  API: http://localhost:8000"
+	@echo "Use local dev commands instead: make dev-backend and make dev-frontend"
 
 down:
-	docker compose down
+	@echo "No containerized services configured. Stop local processes manually."
 
 logs:
-	docker compose logs -f backend frontend
+	@echo "Check logs from your local backend/frontend terminals."
 
 restart-backend:
-	docker compose restart backend
+	@echo "Restart backend by rerunning: make dev-backend"
 
 # ── Database ──────────────────────────────────────────────────────
 db-migrate:
 	cd backend && uv run alembic upgrade head
 
 db-reset:
-	docker compose down -v
-	docker compose up postgres -d
-	sleep 3
+	@echo "No automated database reset configured."
+	@echo "If using local Postgres, recreate DB manually and run migrations."
 	cd backend && uv run alembic upgrade head
 	@echo "Database reset complete"
 
@@ -114,7 +112,6 @@ test:
 
 # ── Cleanup ───────────────────────────────────────────────────────
 clean:
-	docker compose down -v
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .ruff_cache -exec rm -rf {} + 2>/dev/null || true
 	cd frontend && rm -rf dist/ node_modules/.cache/
