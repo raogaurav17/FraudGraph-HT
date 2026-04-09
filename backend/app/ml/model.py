@@ -169,32 +169,6 @@ class HTGNN(nn.Module):
         return torch.sigmoid(logits)
 
 
-def focal_loss(
-    logits: torch.Tensor,
-    labels: torch.Tensor,
-    gamma: float = 2.0,
-    alpha: float = 0.25,
-    reduction: str = "mean",
-) -> torch.Tensor:
-    """
-    Focal loss for extreme class imbalance.
-    Focuses learning on hard-to-classify fraud examples.
-    """
-    p = torch.sigmoid(logits)
-    bce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
-    pt = torch.where(labels == 1, p, 1 - p)
-    at = torch.where(labels == 1,
-                     torch.tensor(alpha, device=logits.device),
-                     torch.tensor(1 - alpha, device=logits.device))
-    loss = at * (1 - pt) ** gamma * bce
-
-    if reduction == "mean":
-        return loss.mean()
-    elif reduction == "sum":
-        return loss.sum()
-    return loss
-
-
 def build_model(metadata, in_channels: Dict[str, int], **kwargs) -> HTGNN:
     """Factory function to build HTGNN with sensible defaults."""
     return HTGNN(

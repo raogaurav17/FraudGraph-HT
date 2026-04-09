@@ -1,5 +1,15 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DATA_DIR = str(PROJECT_ROOT / "data")
+DEFAULT_IEEE_CIS_PATH = str(PROJECT_ROOT / "data" / "ieee_cis")
+DEFAULT_PAYSIM_PATH = str(PROJECT_ROOT / "data" / "paysim")
+DEFAULT_ELLIPTIC_PATH = str(PROJECT_ROOT / "data" / "elliptic")
+DEFAULT_MODEL_PATH = str(PROJECT_ROOT / "models" / "htgnn_latest.pt")
 
 
 class Settings(BaseSettings):
@@ -18,21 +28,21 @@ class Settings(BaseSettings):
     cache_ttl: int = 300  # seconds
 
     # ML Model
-    model_path: str = "models/htgnn_latest.pt"
+    model_path: str = DEFAULT_MODEL_PATH
     model_threshold: float = 0.5
     batch_size: int = 256
     device: str = "cpu"  # "cuda" if GPU available
 
     # Fraud thresholds
-    fraud_threshold_high: float = 0.80
-    fraud_threshold_medium: float = 0.50
-    fraud_threshold_low: float = 0.25
+    fraud_threshold_high: float = 0.60
+    fraud_threshold_medium: float = 0.25
+    fraud_threshold_low: float = 0.15
 
     # Datasets
-    data_dir: str = "/data"
-    ieee_cis_path: str = "/data/ieee_cis"
-    paysim_path: str = "/data/paysim"
-    elliptic_path: str = "/data/elliptic"
+    data_dir: str = DEFAULT_DATA_DIR
+    ieee_cis_path: str = DEFAULT_IEEE_CIS_PATH
+    paysim_path: str = DEFAULT_PAYSIM_PATH
+    elliptic_path: str = DEFAULT_ELLIPTIC_PATH
 
     # WebSocket
     ws_ping_interval: int = 30

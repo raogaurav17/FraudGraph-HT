@@ -21,8 +21,6 @@ class DatasetSource(str, enum.Enum):
     IEEE_CIS = "ieee_cis"
     PAYSIM = "paysim"
     ELLIPTIC = "elliptic"
-    YELP_CHI = "yelp_chi"
-    FRAUD_AMAZON = "fraud_amazon"
     LIVE = "live"
 
 
